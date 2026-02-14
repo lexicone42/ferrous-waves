@@ -18,8 +18,16 @@ impl PyinDetector {
             window_size: 2048,
             min_frequency: 50.0,
             max_frequency: 2000.0,
-            threshold_distribution: Self::generate_threshold_distribution(),
+            threshold_distribution: Self::generate_threshold_distribution_n(100),
         }
+    }
+
+    /// Set the number of PYIN thresholds (default 100, lower = faster).
+    /// 25 gives good results with ~4x speedup in the threshold sweep.
+    pub fn with_threshold_count(mut self, count: usize) -> Self {
+        let count = count.clamp(5, 200);
+        self.threshold_distribution = Self::generate_threshold_distribution_n(count);
+        self
     }
 
     pub fn with_candidates(mut self, num: usize) -> Self {
@@ -38,8 +46,7 @@ impl PyinDetector {
         self
     }
 
-    fn generate_threshold_distribution() -> Vec<f32> {
-        let num_thresholds = 100;
+    fn generate_threshold_distribution_n(num_thresholds: usize) -> Vec<f32> {
         let mut thresholds = Vec::with_capacity(num_thresholds);
 
         for i in 0..num_thresholds {

@@ -90,8 +90,18 @@ impl ContentClassifier {
     }
 
     pub fn classify(&self, samples: &[f32]) -> Result<ContentClassification> {
-        // Calculate features
-        let features = self.extract_features(samples)?;
+        self.classify_with_options(samples, None, false)
+    }
+
+    /// Classify with optional pre-computed spectrogram and option to skip per-segment classification.
+    pub fn classify_with_options(
+        &self,
+        samples: &[f32],
+        precomputed_spectrogram: Option<&Array2<f32>>,
+        skip_segments: bool,
+    ) -> Result<ContentClassification> {
+        // Calculate features (reuse spectrogram if provided)
+        let features = self.extract_features_with_spectrogram(samples, precomputed_spectrogram)?;
 
         // Classify based on features
         let scores = self.calculate_scores(&features);
@@ -99,8 +109,12 @@ impl ContentClassifier {
         // Determine primary type and confidence
         let (primary_type, confidence) = self.determine_primary_type(&scores);
 
-        // Perform segment-based classification
-        let segments = self.classify_segments(samples)?;
+        // Perform segment-based classification (expensive — skip if configured)
+        let segments = if skip_segments {
+            Vec::new()
+        } else {
+            self.classify_segments(samples)?
+        };
 
         Ok(ContentClassification {
             primary_type,
@@ -112,6 +126,14 @@ impl ContentClassifier {
     }
 
     fn extract_features(&self, samples: &[f32]) -> Result<ClassificationFeatures> {
+        self.extract_features_with_spectrogram(samples, None)
+    }
+
+    fn extract_features_with_spectrogram(
+        &self,
+        samples: &[f32],
+        precomputed_spectrogram: Option<&Array2<f32>>,
+    ) -> Result<ClassificationFeatures> {
         // Calculate zero crossing rate
         let zcr_values = self.calculate_zcr(samples);
         let zcr_mean = zcr_values.iter().sum::<f32>() / zcr_values.len() as f32;
@@ -140,17 +162,24 @@ impl ContentClassifier {
             .count();
         let low_energy_rate = low_energy_count as f32 / energy_values.len() as f32;
 
-        // Spectral features using STFT
-        let stft_processor = StftProcessor::new(
-            self.frame_size,
-            self.hop_size,
-            crate::analysis::spectral::WindowFunction::Hann,
-        );
-        let spectrogram = stft_processor.process(samples);
+        // Reuse pre-computed spectrogram if available (same 2048/512 params)
+        let owned_spectrogram;
+        let spectrogram = match precomputed_spectrogram {
+            Some(sg) => sg,
+            None => {
+                let stft_processor = StftProcessor::new(
+                    self.frame_size,
+                    self.hop_size,
+                    crate::analysis::spectral::WindowFunction::Hann,
+                );
+                owned_spectrogram = stft_processor.process(samples);
+                &owned_spectrogram
+            }
+        };
 
         // Calculate spectral features
         let (spectral_rolloff_mean, spectral_centroid_variance, spectral_flux_mean) =
-            self.calculate_spectral_features(&spectrogram);
+            self.calculate_spectral_features(spectrogram);
 
         // Calculate harmonic to noise ratio (simplified)
         let hnr = self.calculate_hnr(samples);

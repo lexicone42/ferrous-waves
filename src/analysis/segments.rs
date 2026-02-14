@@ -1,5 +1,5 @@
-use crate::analysis::classification::{ContentClassifier, ContentType};
-use crate::analysis::musical::MusicalAnalyzer;
+use crate::analysis::classification::ContentType;
+#[allow(unused_imports)]
 use crate::analysis::spectral::StftProcessor;
 use crate::utils::error::Result;
 use std::collections::HashMap;
@@ -373,35 +373,29 @@ impl SegmentAnalyzer {
         start_time: f32,
         duration: f32,
     ) -> Result<AudioSegment> {
-        // Calculate energy
+        // Calculate energy (cheap — time domain only)
         let energy = self.calculate_energy(samples);
 
-        // Calculate spectral centroid
-        let spectral_centroid = self.calculate_spectral_centroid(samples);
+        // Calculate spectral centroid using lightweight method (no STFT)
+        let spectral_centroid = self.calculate_spectral_centroid_fast(samples);
 
-        // Calculate zero crossing rate
+        // Calculate zero crossing rate (cheap — time domain only)
         let zcr = self.calculate_zcr(samples);
 
-        // Classify content type
-        let classifier = ContentClassifier::new(self.sample_rate);
-        let classification = classifier.classify(samples)?;
-
-        // Detect key if musical content
-        let key = if classification.primary_type == ContentType::Music
-            && classification.confidence > 0.5
-        {
-            let musical_analyzer = MusicalAnalyzer::new(self.sample_rate);
-            let musical = musical_analyzer.analyze(samples)?;
-            if musical.key.confidence > 0.3 {
-                Some(musical.key.key)
-            } else {
-                None
-            }
+        // Lightweight content type estimation from time-domain features only.
+        // Avoids creating ContentClassifier + MusicalAnalyzer per segment
+        // which would each compute their own STFTs.
+        let content_type = if energy < 0.01 {
+            ContentType::Silence
         } else {
-            None
+            ContentType::Music // conservative default for jam-band audio
         };
 
-        // Detect tempo (simplified - would use beat tracker in full implementation)
+        // Skip per-segment key detection (extremely expensive — creates MusicalAnalyzer
+        // with full STFT + chord detection per segment). Key is detected once globally.
+        let key = None;
+
+        // Detect tempo (simplified - uses zero crossings)
         let tempo = self.detect_segment_tempo(samples);
 
         // Calculate dynamic range
@@ -412,7 +406,7 @@ impl SegmentAnalyzer {
             energy,
             spectral_centroid,
             zcr,
-            &classification.primary_type,
+            &content_type,
             dynamic_range,
         );
 
@@ -422,7 +416,7 @@ impl SegmentAnalyzer {
             energy,
             spectral_centroid,
             zcr,
-            content_type: classification.primary_type,
+            content_type,
             key,
             tempo,
             dynamic_range,
@@ -440,8 +434,28 @@ impl SegmentAnalyzer {
         (sum / samples.len() as f32).sqrt()
     }
 
+    /// Fast spectral centroid approximation using zero crossing rate.
+    /// ZCR correlates with spectral centroid for most audio signals
+    /// and avoids a full STFT computation per segment.
+    fn calculate_spectral_centroid_fast(&self, samples: &[f32]) -> f32 {
+        if samples.len() < 2 {
+            return 0.0;
+        }
+
+        // Estimate centroid from ZCR: centroid ≈ zcr * sample_rate / 2
+        let mut crossings = 0u32;
+        for i in 1..samples.len() {
+            if (samples[i - 1] >= 0.0) != (samples[i] >= 0.0) {
+                crossings += 1;
+            }
+        }
+
+        let zcr = crossings as f32 / samples.len() as f32;
+        zcr * self.sample_rate / 2.0
+    }
+
+    #[allow(dead_code)]
     fn calculate_spectral_centroid(&self, samples: &[f32]) -> f32 {
-        // Simplified spectral centroid calculation
         let stft = StftProcessor::new(2048, 512, crate::analysis::spectral::WindowFunction::Hann);
         let spectrogram = stft.process(samples);
 

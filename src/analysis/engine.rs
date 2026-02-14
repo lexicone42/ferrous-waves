@@ -137,12 +137,41 @@ struct CacheParams {
     window_function: WindowFunction,
 }
 
+/// Runtime configuration for controlling which analysis steps to perform.
+/// All flags default to the full (original) analysis behavior.
+#[derive(Debug, Clone)]
+pub struct AnalysisConfig {
+    /// Skip PNG visualization generation (waveform, spectrogram, power curve)
+    pub skip_visualization: bool,
+    /// Skip audio fingerprint generation
+    pub skip_fingerprinting: bool,
+    /// Skip per-segment content classification (in ContentClassifier)
+    pub skip_classification_segments: bool,
+    /// Number of PYIN thresholds (default 100, lower = faster but less precise)
+    pub pyin_threshold_count: usize,
+    /// PYIN hop size multiplier (1 = default 512, 2 = 1024, etc.)
+    pub pyin_hop_multiplier: usize,
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            skip_visualization: false,
+            skip_fingerprinting: false,
+            skip_classification_segments: false,
+            pyin_threshold_count: 100,
+            pyin_hop_multiplier: 1,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AnalysisEngine {
     fft_size: usize,
     hop_size: usize,
     window_function: WindowFunction,
     cache: Option<Cache>,
+    config: AnalysisConfig,
 }
 
 impl AnalysisEngine {
@@ -151,7 +180,8 @@ impl AnalysisEngine {
             fft_size: 2048,
             hop_size: 512,
             window_function: WindowFunction::Hann,
-            cache: Some(Cache::new()), // Create a cache by default
+            cache: Some(Cache::new()),
+            config: AnalysisConfig::default(),
         }
     }
 
@@ -160,7 +190,8 @@ impl AnalysisEngine {
             fft_size,
             hop_size,
             window_function,
-            cache: Some(Cache::new()), // Create a cache by default
+            cache: Some(Cache::new()),
+            config: AnalysisConfig::default(),
         }
     }
 
@@ -171,6 +202,11 @@ impl AnalysisEngine {
 
     pub fn without_cache(mut self) -> Self {
         self.cache = None;
+        self
+    }
+
+    pub fn with_analysis_config(mut self, config: AnalysisConfig) -> Self {
+        self.config = config;
         self
     }
 
@@ -281,25 +317,27 @@ impl AnalysisEngine {
             0.0
         };
 
-        // Generate visualizations
-        let renderer = Renderer::new(1920, 600);
-
-        let waveform_base64 = renderer.render_to_base64(&RenderData::Waveform(&mono)).ok();
-        let spectrogram_base64 = renderer
-            .render_to_base64(&RenderData::Spectrogram(&spectrogram))
-            .ok();
-
-        // Calculate power curve for visualization
-        let power_curve: Vec<f32> = (0..spectrogram.shape()[1])
-            .map(|frame_idx| {
-                let frame = spectrogram.column(frame_idx);
-                frame.iter().map(|&x| x * x).sum::<f32>().sqrt()
-            })
-            .collect();
-
-        let power_curve_base64 = renderer
-            .render_to_base64(&RenderData::PowerCurve(&power_curve))
-            .ok();
+        // Generate visualizations (skip if configured)
+        let (waveform_base64, spectrogram_base64, power_curve_base64) =
+            if self.config.skip_visualization {
+                (None, None, None)
+            } else {
+                let renderer = Renderer::new(1920, 600);
+                let wf = renderer.render_to_base64(&RenderData::Waveform(&mono)).ok();
+                let sg = renderer
+                    .render_to_base64(&RenderData::Spectrogram(&spectrogram))
+                    .ok();
+                let power_curve: Vec<f32> = (0..spectrogram.shape()[1])
+                    .map(|frame_idx| {
+                        let frame = spectrogram.column(frame_idx);
+                        frame.iter().map(|&x| x * x).sum::<f32>().sqrt()
+                    })
+                    .collect();
+                let pc = renderer
+                    .render_to_base64(&RenderData::PowerCurve(&power_curve))
+                    .ok();
+                (wf, sg, pc)
+            };
 
         // Generate insights
         let mut insights = Vec::new();
@@ -335,9 +373,13 @@ impl AnalysisEngine {
         // Calculate perceptual metrics
         let perceptual = calculate_perceptual_metrics(&mono, 1, audio.buffer.sample_rate as f32)?;
 
-        // Classify content type
+        // Classify content type (reuse engine's spectrogram, optionally skip per-segment)
         let classifier = ContentClassifier::new(audio.buffer.sample_rate as f32);
-        let classification = classifier.classify(&mono)?;
+        let classification = classifier.classify_with_options(
+            &mono,
+            Some(&spectrogram),
+            self.config.skip_classification_segments,
+        )?;
 
         // Add classification insights
         match classification.primary_type {
@@ -380,9 +422,33 @@ impl AnalysisEngine {
         let segment_analyzer = SegmentAnalyzer::new(audio.buffer.sample_rate as f32);
         let segments = segment_analyzer.analyze(&mono)?;
 
-        // Generate audio fingerprint
-        let fingerprint_generator = FingerprintGenerator::new(audio.buffer.sample_rate as f32);
-        let fingerprint = fingerprint_generator.generate(&mono)?;
+        // Generate audio fingerprint (skip if configured)
+        let fingerprint = if self.config.skip_fingerprinting {
+            AudioFingerprint {
+                fingerprint: Vec::new(),
+                spectral_hashes: Vec::new(),
+                landmarks: Vec::new(),
+                perceptual_hash: 0,
+                metadata: crate::analysis::fingerprint::FingerprintMetadata {
+                    duration: audio.buffer.duration_seconds,
+                    sample_rate: audio.buffer.sample_rate as f32,
+                    avg_energy: 0.0,
+                    dominant_frequencies: Vec::new(),
+                    version: 1,
+                    params: crate::analysis::fingerprint::FingerprintParams {
+                        fft_size: 0,
+                        hop_size: 0,
+                        num_bands: 0,
+                        peak_threshold: 0.0,
+                    },
+                },
+                sub_fingerprints: Vec::new(),
+            }
+        } else {
+            let fingerprint_generator =
+                FingerprintGenerator::new(audio.buffer.sample_rate as f32);
+            fingerprint_generator.generate(&mono)?
+        };
 
         // Add musical insights
         insights.push(format!(
@@ -500,9 +566,10 @@ impl AnalysisEngine {
             recommendations.push("Consider adding more dynamic variation".to_string());
         }
 
-        // Pitch detection
-        let pitch_detector = PyinDetector::new();
-        let hop_size_pitch = 512;
+        // Pitch detection (configurable threshold count and hop size)
+        let pitch_detector =
+            PyinDetector::new().with_threshold_count(self.config.pyin_threshold_count);
+        let hop_size_pitch = 512 * self.config.pyin_hop_multiplier;
         let pitch_track = pitch_detector.detect_pitch_track(
             &mono,
             audio.buffer.sample_rate as f32,
@@ -730,5 +797,12 @@ pub struct ComparisonMetrics {
 impl Default for AnalysisEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// Re-export AnalysisConfig for downstream users
+impl AnalysisEngine {
+    pub fn config(&self) -> &AnalysisConfig {
+        &self.config
     }
 }

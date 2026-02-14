@@ -103,8 +103,19 @@ impl MusicalAnalyzer {
     }
 
     pub fn analyze(&self, samples: &[f32]) -> Result<MusicalAnalysis> {
-        // Compute chromagram
-        let chroma_vector = self.compute_chromagram(samples)?;
+        // Compute STFT once and reuse for all chromagram operations
+        let stft_processor = StftProcessor::new(
+            self.fft_size,
+            self.hop_size,
+            crate::analysis::spectral::WindowFunction::Hann,
+        );
+        let spectrogram = stft_processor.process(samples);
+
+        // Compute per-frame chroma vectors (reused for both key detection and chords)
+        let per_frame_chroma = self.compute_per_frame_chroma(&spectrogram);
+
+        // Aggregate all frames into overall chromagram for key detection
+        let chroma_vector = Self::aggregate_chroma(&per_frame_chroma);
 
         // Detect key using Krumhansl-Kessler profiles
         let key = self.detect_key(&chroma_vector)?;
@@ -118,8 +129,9 @@ impl MusicalAnalyzer {
         // Calculate harmonic complexity
         let harmonic_complexity = self.calculate_harmonic_complexity(&chroma_vector);
 
-        // Detect chord progression (simplified)
-        let chord_progression = self.detect_chord_progression(samples, &key)?;
+        // Detect chord progression using pre-computed per-frame chroma (no re-STFT!)
+        let chord_progression =
+            self.detect_chord_progression_fast(&per_frame_chroma, samples.len(), &key);
 
         // Estimate time signature (basic implementation)
         let time_signature = self.estimate_time_signature(samples)?;
@@ -135,6 +147,47 @@ impl MusicalAnalyzer {
         })
     }
 
+    /// Compute a chroma vector for each STFT frame. Returns Vec of [f32; 12].
+    fn compute_per_frame_chroma(&self, spectrogram: &ndarray::Array2<f32>) -> Vec<[f32; 12]> {
+        let num_frames = spectrogram.shape()[1];
+        let a4_freq = 440.0;
+        let mut result = Vec::with_capacity(num_frames);
+
+        for frame_idx in 0..num_frames {
+            let frame = spectrogram.column(frame_idx);
+            let mut chroma = [0.0f32; 12];
+
+            for (bin_idx, &magnitude) in frame.iter().enumerate() {
+                if magnitude > 0.001 {
+                    let freq = bin_idx as f32 * self.sample_rate / self.fft_size as f32;
+                    if freq > 80.0 && freq < 4000.0 {
+                        let pitch_class = self.freq_to_pitch_class(freq, a4_freq);
+                        chroma[pitch_class] += magnitude;
+                    }
+                }
+            }
+            result.push(chroma);
+        }
+        result
+    }
+
+    /// Aggregate per-frame chroma into a single normalized ChromaVector.
+    fn aggregate_chroma(per_frame: &[[f32; 12]]) -> ChromaVector {
+        let mut chroma = [0.0f32; 12];
+        for frame in per_frame {
+            for (i, &v) in frame.iter().enumerate() {
+                chroma[i] += v;
+            }
+        }
+        let sum: f32 = chroma.iter().sum();
+        if sum > 0.0 {
+            for bin in &mut chroma {
+                *bin /= sum;
+            }
+        }
+        ChromaVector { values: chroma }
+    }
+
     fn compute_chromagram(&self, samples: &[f32]) -> Result<ChromaVector> {
         // Process audio with STFT
         let stft_processor = StftProcessor::new(
@@ -143,42 +196,8 @@ impl MusicalAnalyzer {
             crate::analysis::spectral::WindowFunction::Hann,
         );
         let spectrogram = stft_processor.process(samples);
-
-        // Initialize chroma bins
-        let mut chroma = [0.0f32; 12];
-        let num_frames = spectrogram.shape()[1];
-
-        // Reference frequency for A4
-        let a4_freq = 440.0;
-
-        // Map frequency bins to pitch classes
-        for frame_idx in 0..num_frames {
-            let frame = spectrogram.column(frame_idx);
-
-            for (bin_idx, &magnitude) in frame.iter().enumerate() {
-                if magnitude > 0.001 {
-                    // Threshold for noise
-                    let freq = bin_idx as f32 * self.sample_rate / self.fft_size as f32;
-
-                    if freq > 80.0 && freq < 4000.0 {
-                        // Focus on musical range
-                        // Convert frequency to pitch class
-                        let pitch_class = self.freq_to_pitch_class(freq, a4_freq);
-                        chroma[pitch_class] += magnitude;
-                    }
-                }
-            }
-        }
-
-        // Normalize chroma vector
-        let sum: f32 = chroma.iter().sum();
-        if sum > 0.0 {
-            for bin in &mut chroma {
-                *bin /= sum;
-            }
-        }
-
-        Ok(ChromaVector { values: chroma })
+        let per_frame = self.compute_per_frame_chroma(&spectrogram);
+        Ok(Self::aggregate_chroma(&per_frame))
     }
 
     fn freq_to_pitch_class(&self, freq: f32, a4_freq: f32) -> usize {
@@ -336,13 +355,73 @@ impl MusicalAnalyzer {
         (entropy / 3.58).clamp(0.0, 1.0)
     }
 
+    /// Fast chord detection using pre-computed per-frame chroma vectors.
+    /// Eliminates ~3800 STFT recomputations on a 16-min track.
+    fn detect_chord_progression_fast(
+        &self,
+        per_frame_chroma: &[[f32; 12]],
+        total_samples: usize,
+        key: &MusicalKey,
+    ) -> Option<ChordProgression> {
+        if per_frame_chroma.is_empty() {
+            return None;
+        }
+
+        let segment_duration = 0.5; // 500ms segments
+        let total_duration = total_samples as f32 / self.sample_rate;
+
+        // How many STFT frames correspond to one 0.5s segment?
+        let frames_per_segment =
+            ((segment_duration * self.sample_rate) / self.hop_size as f32).ceil() as usize;
+        let frames_per_hop = frames_per_segment / 2; // 50% overlap
+
+        if frames_per_segment == 0 || per_frame_chroma.len() < frames_per_segment {
+            return None;
+        }
+
+        let mut chords = Vec::new();
+        let mut frame_start = 0;
+
+        while frame_start + frames_per_segment <= per_frame_chroma.len() {
+            // Aggregate chroma over this temporal window
+            let window = &per_frame_chroma[frame_start..frame_start + frames_per_segment];
+            let chroma = Self::aggregate_chroma(window);
+
+            let start_time = frame_start as f32 * self.hop_size as f32 / self.sample_rate;
+
+            if let Some(chord) = self.detect_chord(&chroma, key) {
+                chords.push(ChordEvent {
+                    chord: chord.name,
+                    start_time,
+                    duration: segment_duration.min(total_duration - start_time),
+                    confidence: chord.confidence,
+                });
+            }
+
+            frame_start += frames_per_hop;
+        }
+
+        if chords.is_empty() {
+            return None;
+        }
+
+        let avg_confidence =
+            chords.iter().map(|c| c.confidence).sum::<f32>() / chords.len() as f32;
+
+        Some(ChordProgression {
+            chords,
+            confidence: avg_confidence,
+        })
+    }
+
+    #[allow(dead_code)]
     fn detect_chord_progression(
         &self,
         samples: &[f32],
         key: &MusicalKey,
     ) -> Result<Option<ChordProgression>> {
-        // Simplified chord detection - segment audio and detect chords
-        let segment_duration = 0.5; // 500ms segments
+        // Legacy method kept for backward compat / tests
+        let segment_duration = 0.5;
         let segment_samples = (segment_duration * self.sample_rate) as usize;
 
         if samples.len() < segment_samples {
@@ -365,15 +444,15 @@ impl MusicalAnalyzer {
                 });
             }
 
-            pos += segment_samples / 2; // 50% overlap
+            pos += segment_samples / 2;
         }
 
         if chords.is_empty() {
             return Ok(None);
         }
 
-        // Calculate overall progression confidence
-        let avg_confidence = chords.iter().map(|c| c.confidence).sum::<f32>() / chords.len() as f32;
+        let avg_confidence =
+            chords.iter().map(|c| c.confidence).sum::<f32>() / chords.len() as f32;
 
         Ok(Some(ChordProgression {
             chords,
