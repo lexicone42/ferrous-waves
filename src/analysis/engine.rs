@@ -48,8 +48,15 @@ pub struct SpectralAnalysis {
     pub spectral_centroid: Vec<f32>,
     pub spectral_rolloff: Vec<f32>,
     pub spectral_flux: Vec<f32>,
+    pub spectral_flatness: Vec<f32>,
+    pub spectral_bandwidth: Vec<f32>,
+    pub zero_crossing_rate: Vec<f32>,
     pub mfcc: Vec<Vec<f32>>,
     pub dominant_frequencies: Vec<f32>,
+    pub sub_band_energy_bass: Vec<f32>,
+    pub sub_band_energy_mid: Vec<f32>,
+    pub sub_band_energy_high: Vec<f32>,
+    pub sub_band_energy_presence: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,11 +255,27 @@ impl AnalysisEngine {
         let spectrogram = stft.process(&mono);
 
         // Calculate spectral features
-        let mut spectral_centroids = Vec::new();
-        let mut spectral_flux = Vec::new();
+        let num_frames = spectrogram.shape()[1];
+        let num_bins = spectrogram.shape()[0];
+        let mut spectral_centroids = Vec::with_capacity(num_frames);
+        let mut spectral_flux = Vec::with_capacity(num_frames);
+        let mut spectral_rolloff = Vec::with_capacity(num_frames);
+        let mut spectral_flatness = Vec::with_capacity(num_frames);
         let mut dominant_frequencies = Vec::new();
+        let mut spectral_bandwidth = Vec::with_capacity(num_frames);
+        let mut sub_band_energy_bass = Vec::with_capacity(num_frames);
+        let mut sub_band_energy_mid = Vec::with_capacity(num_frames);
+        let mut sub_band_energy_high = Vec::with_capacity(num_frames);
+        let mut sub_band_energy_presence = Vec::with_capacity(num_frames);
 
-        for frame_idx in 0..spectrogram.shape()[1] {
+        // Pre-compute bin boundaries for sub-band energy
+        let sr = audio.buffer.sample_rate as f32;
+        let bin_bass_end = (250.0 * self.fft_size as f32 / sr).ceil() as usize;
+        let bin_mid_end = (2000.0 * self.fft_size as f32 / sr).ceil() as usize;
+        let bin_high_end = (8000.0 * self.fft_size as f32 / sr).ceil() as usize;
+        let bin_bass_start = (20.0 * self.fft_size as f32 / sr).floor() as usize;
+
+        for frame_idx in 0..num_frames {
             let frame = spectrogram.column(frame_idx);
 
             // Spectral centroid
@@ -272,13 +295,74 @@ impl AnalysisEngine {
                 }
             }
 
+            let centroid_val = if magnitude_sum > 0.0 {
+                let c = weighted_sum / magnitude_sum;
+                spectral_centroids.push(c);
+                c
+            } else {
+                spectral_centroids.push(0.0);
+                0.0
+            };
+
+            // Spectral bandwidth: weighted std dev around centroid, normalized to [0,1] of Nyquist
+            let nyquist = sr / 2.0;
             if magnitude_sum > 0.0 {
-                spectral_centroids.push(weighted_sum / magnitude_sum);
+                let mut bw_sum = 0.0_f32;
+                for (bin, &mag) in frame.iter().enumerate() {
+                    let freq = bin as f32 * sr / self.fft_size as f32;
+                    let diff = freq - centroid_val;
+                    bw_sum += diff * diff * mag;
+                }
+                let bw = (bw_sum / magnitude_sum).sqrt() / nyquist;
+                spectral_bandwidth.push(bw.clamp(0.0, 1.0));
+            } else {
+                spectral_bandwidth.push(0.0);
             }
+
+            // Sub-band energy: sum magnitudes in each band, normalize by total
+            let total_energy_sb: f32 = frame.iter().sum::<f32>().max(1e-10);
+            let bass: f32 = frame.iter().skip(bin_bass_start).take(bin_bass_end.saturating_sub(bin_bass_start)).sum();
+            let mid: f32 = frame.iter().skip(bin_bass_end).take(bin_mid_end.saturating_sub(bin_bass_end)).sum();
+            let high: f32 = frame.iter().skip(bin_mid_end).take(bin_high_end.saturating_sub(bin_mid_end)).sum();
+            let presence: f32 = frame.iter().skip(bin_high_end).sum();
+            sub_band_energy_bass.push(bass / total_energy_sb);
+            sub_band_energy_mid.push(mid / total_energy_sb);
+            sub_band_energy_high.push(high / total_energy_sb);
+            sub_band_energy_presence.push(presence / total_energy_sb);
 
             if frame_idx < 5 {
                 dominant_frequencies.push(peak_freq);
             }
+
+            // Spectral rolloff (85% of energy)
+            let total_energy: f32 = frame.iter().sum();
+            let rolloff_threshold = total_energy * 0.85;
+            let mut cumulative_energy = 0.0;
+            let mut rolloff_bin = 0;
+            for (bin, &mag) in frame.iter().enumerate() {
+                cumulative_energy += mag;
+                if cumulative_energy >= rolloff_threshold {
+                    rolloff_bin = bin;
+                    break;
+                }
+            }
+            // Normalize to 0.0-1.0 as fraction of Nyquist
+            let rolloff_freq = rolloff_bin as f32 / num_bins as f32;
+            spectral_rolloff.push(rolloff_freq);
+
+            // Spectral flatness: geometric mean / arithmetic mean of power spectrum
+            // Using exp(mean(ln(x+eps))) / mean(x+eps) for numerical stability
+            let epsilon = 1e-10_f32;
+            let n = frame.len() as f32;
+            let log_sum: f32 = frame.iter().map(|&mag| (mag + epsilon).ln()).sum();
+            let arith_mean = (magnitude_sum + epsilon * n) / n;
+            let geo_mean = (log_sum / n).exp();
+            let flatness = if arith_mean > 0.0 {
+                (geo_mean / arith_mean).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            spectral_flatness.push(flatness);
 
             // Spectral flux
             if frame_idx > 0 {
@@ -291,6 +375,71 @@ impl AnalysisEngine {
                 spectral_flux.push(flux.sqrt());
             }
         }
+
+        // Zero crossing rate (time-domain, windowed to match STFT frames)
+        let zero_crossing_rate = {
+            let frame_size = self.fft_size;
+            let hop_size = self.hop_size;
+            let mut zcr_values = Vec::with_capacity(num_frames);
+            let mut pos = 0;
+            while pos + frame_size <= mono.len() {
+                let frame = &mono[pos..pos + frame_size];
+                let mut crossings = 0u32;
+                for i in 1..frame.len() {
+                    if (frame[i] >= 0.0) != (frame[i - 1] >= 0.0) {
+                        crossings += 1;
+                    }
+                }
+                zcr_values.push(crossings as f32 / frame_size as f32);
+                pos += hop_size;
+            }
+            zcr_values
+        };
+
+        // MFCC computation: spectrogram → mel filterbank → log energy → DCT-II → 13 coefficients
+        let mfcc = {
+            let num_mel_filters = 40;
+            let num_mfcc = 13;
+            let mel_bank = crate::analysis::spectral::mel::MelFilterBank::new(
+                num_mel_filters,
+                audio.buffer.sample_rate,
+                self.fft_size,
+            );
+            let mel_spec = mel_bank.apply(&spectrogram); // shape: [num_mel_filters, num_frames]
+            let mel_frames = mel_spec.shape()[1];
+
+            // Pre-compute DCT-II basis vectors for efficiency
+            let mut dct_basis = vec![vec![0.0_f32; num_mel_filters]; num_mfcc];
+            for k in 0..num_mfcc {
+                for n in 0..num_mel_filters {
+                    dct_basis[k][n] = (std::f32::consts::PI * k as f32 * (n as f32 + 0.5)
+                        / num_mel_filters as f32)
+                        .cos();
+                }
+            }
+
+            let mut coefficients: Vec<Vec<f32>> = (0..num_mfcc)
+                .map(|_| Vec::with_capacity(mel_frames))
+                .collect();
+
+            for frame_idx in 0..mel_frames {
+                // Log mel energies
+                let log_energies: Vec<f32> = (0..num_mel_filters)
+                    .map(|i| (mel_spec[[i, frame_idx]] + 1e-10).ln())
+                    .collect();
+
+                // Apply DCT-II to get MFCC coefficients
+                for (k, coeff_vec) in coefficients.iter_mut().enumerate() {
+                    let val: f32 = log_energies
+                        .iter()
+                        .zip(dct_basis[k].iter())
+                        .map(|(&e, &b)| e * b)
+                        .sum();
+                    coeff_vec.push(val);
+                }
+            }
+            coefficients
+        };
 
         // Temporal analysis
         let onset_detector = OnsetDetector::new();
@@ -659,10 +808,17 @@ impl AnalysisEngine {
             },
             spectral: SpectralAnalysis {
                 spectral_centroid: spectral_centroids,
-                spectral_rolloff: vec![],
+                spectral_rolloff,
                 spectral_flux,
-                mfcc: vec![],
+                spectral_flatness,
+                spectral_bandwidth,
+                zero_crossing_rate,
+                mfcc,
                 dominant_frequencies,
+                sub_band_energy_bass,
+                sub_band_energy_mid,
+                sub_band_energy_high,
+                sub_band_energy_presence,
             },
             temporal: TemporalAnalysis {
                 tempo,
