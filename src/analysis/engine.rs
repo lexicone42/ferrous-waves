@@ -559,9 +559,13 @@ impl AnalysisEngine {
             }
         }
 
-        // Perform musical analysis
+        // Perform musical analysis (reuse engine's spectrogram to avoid a second STFT)
         let musical_analyzer = MusicalAnalyzer::new(audio.buffer.sample_rate as f32);
-        let musical = musical_analyzer.analyze(&mono)?;
+        let musical = musical_analyzer.analyze_with_spectrogram(
+            &spectrogram,
+            self.fft_size,
+            mono.len(),
+        )?;
 
         // Assess audio quality
         let quality_analyzer = QualityAnalyzer::new(audio.buffer.sample_rate as f32);

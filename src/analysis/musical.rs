@@ -111,8 +111,29 @@ impl MusicalAnalyzer {
         );
         let spectrogram = stft_processor.process(samples);
 
+        self.analyze_inner(&spectrogram, self.fft_size, samples.len())
+    }
+
+    /// Analyze using a pre-computed spectrogram, avoiding a redundant STFT.
+    /// `spectrogram_fft_size` is the FFT size used to produce the spectrogram
+    /// (needed for correct frequency bin mapping in chroma extraction).
+    pub fn analyze_with_spectrogram(
+        &self,
+        spectrogram: &ndarray::Array2<f32>,
+        spectrogram_fft_size: usize,
+        num_samples: usize,
+    ) -> Result<MusicalAnalysis> {
+        self.analyze_inner(spectrogram, spectrogram_fft_size, num_samples)
+    }
+
+    fn analyze_inner(
+        &self,
+        spectrogram: &ndarray::Array2<f32>,
+        fft_size: usize,
+        num_samples: usize,
+    ) -> Result<MusicalAnalysis> {
         // Compute per-frame chroma vectors (reused for both key detection and chords)
-        let per_frame_chroma = self.compute_per_frame_chroma(&spectrogram);
+        let per_frame_chroma = self.compute_per_frame_chroma_with_fft_size(spectrogram, fft_size);
 
         // Aggregate all frames into overall chromagram for key detection
         let chroma_vector = Self::aggregate_chroma(&per_frame_chroma);
@@ -129,12 +150,12 @@ impl MusicalAnalyzer {
         // Calculate harmonic complexity
         let harmonic_complexity = self.calculate_harmonic_complexity(&chroma_vector);
 
-        // Detect chord progression using pre-computed per-frame chroma (no re-STFT!)
+        // Detect chord progression using pre-computed per-frame chroma
         let chord_progression =
-            self.detect_chord_progression_fast(&per_frame_chroma, samples.len(), &key);
+            self.detect_chord_progression_fast(&per_frame_chroma, num_samples, &key);
 
         // Estimate time signature (basic implementation)
-        let time_signature = self.estimate_time_signature(samples)?;
+        let time_signature = Self::estimate_time_signature()?;
 
         Ok(MusicalAnalysis {
             key,
@@ -149,6 +170,15 @@ impl MusicalAnalyzer {
 
     /// Compute a chroma vector for each STFT frame. Returns Vec of [f32; 12].
     fn compute_per_frame_chroma(&self, spectrogram: &ndarray::Array2<f32>) -> Vec<[f32; 12]> {
+        self.compute_per_frame_chroma_with_fft_size(spectrogram, self.fft_size)
+    }
+
+    /// Compute chroma vectors using a spectrogram produced with the given fft_size.
+    fn compute_per_frame_chroma_with_fft_size(
+        &self,
+        spectrogram: &ndarray::Array2<f32>,
+        fft_size: usize,
+    ) -> Vec<[f32; 12]> {
         let num_frames = spectrogram.shape()[1];
         let a4_freq = 440.0;
         let mut result = Vec::with_capacity(num_frames);
@@ -159,7 +189,7 @@ impl MusicalAnalyzer {
 
             for (bin_idx, &magnitude) in frame.iter().enumerate() {
                 if magnitude > 0.001 {
-                    let freq = bin_idx as f32 * self.sample_rate / self.fft_size as f32;
+                    let freq = bin_idx as f32 * self.sample_rate / fft_size as f32;
                     if freq > 80.0 && freq < 4000.0 {
                         let pitch_class = self.freq_to_pitch_class(freq, a4_freq);
                         chroma[pitch_class] += magnitude;
@@ -515,11 +545,8 @@ impl MusicalAnalyzer {
         score
     }
 
-    fn estimate_time_signature(&self, _samples: &[f32]) -> Result<Option<TimeSignature>> {
-        // Basic time signature estimation using onset patterns
-        // This is a simplified implementation
-
-        // For now, return a default 4/4 with medium confidence
+    fn estimate_time_signature() -> Result<Option<TimeSignature>> {
+        // Stub: returns default 4/4. Real implementation would use onset patterns.
         Ok(Some(TimeSignature {
             numerator: 4,
             denominator: 4,
