@@ -1,139 +1,124 @@
-use std::fs::File;
 use std::path::Path;
-use symphonia::core::audio::AudioBufferRef;
-use symphonia::core::codecs::{Decoder, DecoderOptions};
-use symphonia::core::formats::{FormatOptions, FormatReader};
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 use crate::utils::error::{FerrousError, Result};
 
+/// Unified audio decoder using hound (WAV) and puremp3 (MP3).
+/// Replaces the previous symphonia-based decoder with focused, pure-Rust crates.
 pub struct AudioDecoder {
-    format_reader: Box<dyn FormatReader>,
-    decoder: Box<dyn Decoder>,
-    track_id: u32,
+    samples: Vec<f32>,
+    sample_rate: u32,
+    channels: usize,
 }
 
 impl AudioDecoder {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = File::open(&path)
-            .map_err(|e| FerrousError::AudioDecode(format!("Failed to open file: {}", e)))?;
+        let path = path.as_ref();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
 
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-        // Create hint from file extension
-        let mut hint = Hint::new();
-        if let Some(ext) = path.as_ref().extension() {
-            hint.with_extension(ext.to_string_lossy().as_ref());
+        match ext.as_str() {
+            "wav" | "wave" => Self::decode_wav(path),
+            "mp3" => Self::decode_mp3(path),
+            _ => Err(FerrousError::AudioDecode(format!(
+                "Unsupported format: {}",
+                ext
+            ))),
         }
+    }
 
-        // Probe the media source
-        let probe_result = symphonia::default::get_probe()
-            .format(
-                &hint,
-                mss,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
-            )
-            .map_err(|e| FerrousError::AudioDecode(format!("Failed to probe format: {}", e)))?;
+    fn decode_wav(path: &Path) -> Result<Self> {
+        let reader = hound::WavReader::open(path)
+            .map_err(|e| FerrousError::AudioDecode(format!("WAV open error: {}", e)))?;
 
-        let format_reader = probe_result.format;
+        let spec = reader.spec();
+        let sample_rate = spec.sample_rate;
+        let channels = spec.channels as usize;
 
-        // Find the first audio track
-        let track = format_reader
-            .tracks()
-            .iter()
-            .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-            .ok_or_else(|| FerrousError::AudioDecode("No audio tracks found".to_string()))?;
-
-        let track_id = track.id;
-
-        // Create decoder
-        let decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
-            .map_err(|e| FerrousError::AudioDecode(format!("Failed to create decoder: {}", e)))?;
+        let samples = match (spec.sample_format, spec.bits_per_sample) {
+            (hound::SampleFormat::Int, 16) => reader
+                .into_samples::<i16>()
+                .map(|s| {
+                    s.map(|s| s as f32 / i16::MAX as f32)
+                        .map_err(|e| FerrousError::AudioDecode(format!("WAV sample error: {}", e)))
+                })
+                .collect::<Result<Vec<f32>>>()?,
+            (hound::SampleFormat::Int, 24) => reader
+                .into_samples::<i32>()
+                .map(|s| {
+                    s.map(|s| s as f32 / 8_388_608.0) // 2^23
+                        .map_err(|e| FerrousError::AudioDecode(format!("WAV sample error: {}", e)))
+                })
+                .collect::<Result<Vec<f32>>>()?,
+            (hound::SampleFormat::Int, 32) => reader
+                .into_samples::<i32>()
+                .map(|s| {
+                    s.map(|s| s as f32 / i32::MAX as f32)
+                        .map_err(|e| FerrousError::AudioDecode(format!("WAV sample error: {}", e)))
+                })
+                .collect::<Result<Vec<f32>>>()?,
+            (hound::SampleFormat::Float, _) => reader
+                .into_samples::<f32>()
+                .map(|s| {
+                    s.map_err(|e| FerrousError::AudioDecode(format!("WAV sample error: {}", e)))
+                })
+                .collect::<Result<Vec<f32>>>()?,
+            (fmt, bits) => {
+                return Err(FerrousError::AudioDecode(format!(
+                    "Unsupported WAV format: {:?} {}bit",
+                    fmt, bits
+                )))
+            }
+        };
 
         Ok(Self {
-            format_reader,
-            decoder,
-            track_id,
+            samples,
+            sample_rate,
+            channels,
+        })
+    }
+
+    fn decode_mp3(path: &Path) -> Result<Self> {
+        let data = std::fs::read(path)
+            .map_err(|e| FerrousError::AudioDecode(format!("MP3 read error: {}", e)))?;
+
+        let (header, samples_iter) = puremp3::read_mp3(&data[..])
+            .map_err(|e| FerrousError::AudioDecode(format!("MP3 decode error: {:?}", e)))?;
+
+        let sample_rate = header.sample_rate.hz();
+        let channels = if header.channels == puremp3::Channels::Mono {
+            1
+        } else {
+            2
+        };
+
+        // puremp3 yields (f32, f32) stereo pairs
+        let mut samples = Vec::new();
+        for (left, right) in samples_iter {
+            samples.push(left);
+            if channels == 2 {
+                samples.push(right);
+            }
+        }
+
+        Ok(Self {
+            samples,
+            sample_rate,
+            channels,
         })
     }
 
     pub fn decode_all(&mut self) -> Result<Vec<f32>> {
-        let mut samples = Vec::new();
-
-        loop {
-            let packet = match self.format_reader.next_packet() {
-                Ok(packet) => packet,
-                Err(symphonia::core::errors::Error::ResetRequired) => {
-                    self.decoder.reset();
-                    continue;
-                }
-                Err(symphonia::core::errors::Error::IoError(e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    break
-                }
-                Err(e) => {
-                    return Err(FerrousError::AudioDecode(format!(
-                        "Packet read error: {}",
-                        e
-                    )))
-                }
-            };
-
-            if packet.track_id() != self.track_id {
-                continue;
-            }
-
-            let decoded = match self.decoder.decode(&packet) {
-                Ok(decoded) => decoded,
-                Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-                Err(e) => return Err(FerrousError::AudioDecode(format!("Decode error: {}", e))),
-            };
-
-            copy_samples(&decoded, &mut samples)?;
-        }
-
-        Ok(samples)
+        Ok(std::mem::take(&mut self.samples))
     }
 
     pub fn sample_rate(&self) -> Option<u32> {
-        self.format_reader
-            .tracks()
-            .iter()
-            .find(|t| t.id == self.track_id)
-            .and_then(|t| t.codec_params.sample_rate)
+        Some(self.sample_rate)
     }
 
     pub fn num_channels(&self) -> Option<usize> {
-        self.format_reader
-            .tracks()
-            .iter()
-            .find(|t| t.id == self.track_id)
-            .and_then(|t| t.codec_params.channels.map(|c| c.count()))
+        Some(self.channels)
     }
-}
-
-fn copy_samples(decoded: &AudioBufferRef, samples: &mut Vec<f32>) -> Result<()> {
-    match decoded {
-        AudioBufferRef::F32(buf) => {
-            for plane in buf.planes().planes() {
-                samples.extend_from_slice(plane);
-            }
-        }
-        AudioBufferRef::S16(buf) => {
-            for plane in buf.planes().planes() {
-                samples.extend(plane.iter().map(|&s| s as f32 / i16::MAX as f32));
-            }
-        }
-        _ => {
-            return Err(FerrousError::AudioDecode(
-                "Unsupported sample format".to_string(),
-            ))
-        }
-    }
-    Ok(())
 }

@@ -11,9 +11,9 @@ keywords = ["audio", "analysis", "mcp", "fft", "visualization"]
 categories = ["multimedia::audio", "science", "visualization"]
 
 [dependencies]
-# Audio processing
-symphonia = { version = "0.5", features = ["all"] }
+# Audio decoding (pure Rust, no C dependencies)
 hound = "3.5"
+puremp3 = "0.1"
 rustfft = "6.1"
 realfft = "3.3"
 wide = "0.7"
