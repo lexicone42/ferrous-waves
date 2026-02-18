@@ -24,6 +24,8 @@ pub struct MusicalKey {
 pub enum KeyMode {
     Major,
     Minor,
+    Mixolydian,
+    Dorian,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -147,8 +149,9 @@ impl MusicalAnalyzer {
         // Calculate mode clarity (how clearly major vs minor)
         let mode_clarity = self.calculate_mode_clarity(&chroma_vector, &key);
 
-        // Calculate harmonic complexity
-        let harmonic_complexity = self.calculate_harmonic_complexity(&chroma_vector);
+        // Calculate harmonic complexity using per-frame chroma movement
+        let harmonic_complexity =
+            self.calculate_harmonic_complexity_from_frames(&per_frame_chroma);
 
         // Detect chord progression using pre-computed per-frame chroma
         let chord_progression =
@@ -239,7 +242,7 @@ impl MusicalAnalyzer {
     }
 
     fn detect_key(&self, chroma: &ChromaVector) -> Result<MusicalKey> {
-        // Krumhansl-Kessler key profiles
+        // Krumhansl-Kessler key profiles for major and minor
         let major_profile = [
             6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
         ];
@@ -247,30 +250,45 @@ impl MusicalAnalyzer {
             6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
         ];
 
+        // Modal profiles derived from scale degrees.
+        // Mixolydian (major with b7) — Grateful Dead staple (Fire on the Mountain, Scarlet Begonias)
+        // Weight pattern: tonic strong, 3rd major, 5th strong, b7 strong (distinguishes from major)
+        let mixolydian_profile = [
+            6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 3.80, 2.29,
+        ];
+        // Dorian (minor with natural 6) — common in jam-band improvisation
+        // Weight pattern: tonic strong, b3 present, 5th strong, natural 6 distinguishes from minor
+        let dorian_profile = [
+            6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 2.69, 3.98, 3.34, 2.69,
+        ];
+
         let mut key_scores = Vec::new();
         let note_names = [
             "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
         ];
 
-        // Test all 24 keys (12 major + 12 minor)
-        for (shift, note_name) in note_names.iter().enumerate() {
-            // Major key correlation
-            let major_score = self.correlate_profiles(&chroma.values, &major_profile, shift);
-            key_scores.push(KeyCandidate {
-                key: format!("{} major", note_name),
-                root: note_name.to_string(),
-                mode: KeyMode::Major,
-                score: major_score,
-            });
+        // Use Pearson correlation instead of dot product for better discrimination.
+        // Dot product favors whichever profile has higher total weight; Pearson
+        // measures shape similarity independent of magnitude.
 
-            // Minor key correlation
-            let minor_score = self.correlate_profiles(&chroma.values, &minor_profile, shift);
-            key_scores.push(KeyCandidate {
-                key: format!("{} minor", note_name),
-                root: note_name.to_string(),
-                mode: KeyMode::Minor,
-                score: minor_score,
-            });
+        // Test all 48 keys (12 roots × 4 modes)
+        for (shift, note_name) in note_names.iter().enumerate() {
+            let profiles: &[(&[f32; 12], KeyMode, &str)] = &[
+                (&major_profile, KeyMode::Major, "major"),
+                (&minor_profile, KeyMode::Minor, "minor"),
+                (&mixolydian_profile, KeyMode::Mixolydian, "mixolydian"),
+                (&dorian_profile, KeyMode::Dorian, "dorian"),
+            ];
+
+            for &(profile, ref mode, mode_name) in profiles {
+                let score = self.pearson_correlate(&chroma.values, profile, shift);
+                key_scores.push(KeyCandidate {
+                    key: format!("{} {}", note_name, mode_name),
+                    root: note_name.to_string(),
+                    mode: mode.clone(),
+                    score,
+                });
+            }
         }
 
         // Sort by score
@@ -294,6 +312,41 @@ impl MusicalAnalyzer {
         })
     }
 
+    /// Pearson correlation between chroma and a profile template (shifted by `shift` semitones).
+    /// Unlike dot product, Pearson correlation is insensitive to the overall magnitude of
+    /// chroma energy, comparing only the *shape* of the distribution.
+    fn pearson_correlate(&self, chroma: &[f32; 12], profile: &[f32; 12], shift: usize) -> f32 {
+        // Gather shifted chroma values
+        let mut x = [0.0_f32; 12];
+        for i in 0..12 {
+            x[i] = chroma[(i + shift) % 12];
+        }
+        let y = profile;
+
+        let n = 12.0_f32;
+        let mean_x = x.iter().sum::<f32>() / n;
+        let mean_y = y.iter().sum::<f32>() / n;
+
+        let mut cov = 0.0_f32;
+        let mut var_x = 0.0_f32;
+        let mut var_y = 0.0_f32;
+
+        for i in 0..12 {
+            let dx = x[i] - mean_x;
+            let dy = y[i] - mean_y;
+            cov += dx * dy;
+            var_x += dx * dx;
+            var_y += dy * dy;
+        }
+
+        let denom = (var_x * var_y).sqrt();
+        if denom > 1e-10 {
+            cov / denom
+        } else {
+            0.0
+        }
+    }
+
     fn correlate_profiles(&self, chroma: &[f32; 12], profile: &[f32; 12], shift: usize) -> f32 {
         let mut correlation = 0.0;
 
@@ -313,14 +366,16 @@ impl MusicalAnalyzer {
         let best_score = scores[0].score;
         let second_score = scores[1].score;
 
-        // Calculate confidence based on separation from next best
-        let separation = (best_score - second_score) / best_score.max(0.001);
+        // Pearson correlation ranges -1 to 1. Separation is the gap between
+        // the best and second-best candidates.
+        let separation = best_score - second_score;
 
-        // Also consider absolute score value
-        let normalized_best = (best_score / 100.0).min(1.0);
+        // Confidence: 70% from how much the best key stands out, 30% from
+        // absolute correlation strength.
+        let sep_factor = (separation / 0.15).clamp(0.0, 1.0); // 0.15 gap → full confidence
+        let strength_factor = ((best_score + 1.0) / 2.0).clamp(0.0, 1.0); // map -1..1 to 0..1
 
-        // Combine factors
-        (separation * 0.7 + normalized_best * 0.3).clamp(0.0, 1.0)
+        (sep_factor * 0.7 + strength_factor * 0.3).clamp(0.0, 1.0)
     }
 
     fn calculate_tonality(&self, chroma: &ChromaVector, key: &MusicalKey) -> f32 {
@@ -335,16 +390,22 @@ impl MusicalAnalyzer {
             KeyMode::Minor => [
                 6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
             ],
+            KeyMode::Mixolydian => [
+                6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 3.80, 2.29,
+            ],
+            KeyMode::Dorian => [
+                6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 2.69, 3.98, 3.34, 2.69,
+            ],
         };
 
         // Find root note index
         let root_idx = self.note_to_index(&key.root);
 
-        // Calculate correlation
-        let correlation = self.correlate_profiles(&chroma.values, &profile, root_idx);
+        // Calculate Pearson correlation (already in -1..1 range)
+        let correlation = self.pearson_correlate(&chroma.values, &profile, root_idx);
 
-        // Normalize to 0-1 range
-        (correlation / 100.0).clamp(0.0, 1.0)
+        // Map to 0-1 range
+        ((correlation + 1.0) / 2.0).clamp(0.0, 1.0)
     }
 
     fn calculate_mode_clarity(&self, chroma: &ChromaVector, key: &MusicalKey) -> f32 {
@@ -370,8 +431,80 @@ impl MusicalAnalyzer {
         (third_diff * 2.0 + fifth_weight).min(1.0)
     }
 
+    /// Measure harmonic complexity via chroma flux at musically meaningful intervals.
+    ///
+    /// The old entropy-of-aggregate-chroma approach saturates near 1.0 for any
+    /// polyphonic music, since live band recordings have near-uniform pitch-class
+    /// distribution when aggregated. Instead, this measures how the harmonic
+    /// content changes at ~500ms intervals — songs with frequent chord changes
+    /// and modulations score higher.
+    ///
+    /// Consecutive STFT frames (~12ms apart) are nearly identical, so we average
+    /// chroma over half-second windows before comparing.
+    fn calculate_harmonic_complexity_from_frames(&self, per_frame_chroma: &[[f32; 12]]) -> f32 {
+        // ~500ms windows: at hop_size=512 and sr=44100, one frame ≈ 11.6ms → ~43 frames per 500ms
+        let window_size = 43.max(1);
+        if per_frame_chroma.len() < window_size * 2 {
+            return 0.0;
+        }
+
+        // Average chroma over windows
+        let num_windows = per_frame_chroma.len() / window_size;
+        let mut windows: Vec<[f32; 12]> = Vec::with_capacity(num_windows);
+
+        for w in 0..num_windows {
+            let start = w * window_size;
+            let end = (start + window_size).min(per_frame_chroma.len());
+            let mut avg = [0.0f32; 12];
+            for frame in &per_frame_chroma[start..end] {
+                for (i, &v) in frame.iter().enumerate() {
+                    avg[i] += v;
+                }
+            }
+            let n = (end - start) as f32;
+            for v in &mut avg {
+                *v /= n;
+            }
+            windows.push(avg);
+        }
+
+        if windows.len() < 2 {
+            return 0.0;
+        }
+
+        // Compute cosine distance between consecutive half-second windows
+        let mut total_distance = 0.0_f32;
+        let mut count = 0;
+
+        for pair in windows.windows(2) {
+            let prev = &pair[0];
+            let curr = &pair[1];
+
+            let dot: f32 = prev.iter().zip(curr.iter()).map(|(&a, &b)| a * b).sum();
+            let mag_a: f32 = prev.iter().map(|&v| v * v).sum::<f32>().sqrt();
+            let mag_b: f32 = curr.iter().map(|&v| v * v).sum::<f32>().sqrt();
+
+            let denom = mag_a * mag_b;
+            if denom > 1e-10 {
+                let cosine_sim = (dot / denom).clamp(-1.0, 1.0);
+                total_distance += 1.0 - cosine_sim;
+            }
+            count += 1;
+        }
+
+        if count == 0 {
+            return 0.0;
+        }
+
+        let mean_distance = total_distance / count as f32;
+
+        // Half-second chroma distances typically range 0.0 (sustained drone) to ~0.15
+        // (rapid chord changes/modulations). Map to 0-1 with saturation at 0.12.
+        (mean_distance / 0.12).clamp(0.0, 1.0)
+    }
+
+    /// Legacy: entropy of aggregate chroma. Kept for tests.
     fn calculate_harmonic_complexity(&self, chroma: &ChromaVector) -> f32 {
-        // Measure entropy of chroma distribution
         let mut entropy = 0.0;
 
         for &value in &chroma.values {
@@ -380,8 +513,6 @@ impl MusicalAnalyzer {
             }
         }
 
-        // Normalize entropy to 0-1 range
-        // Max entropy for uniform distribution is log2(12) ≈ 3.58
         (entropy / 3.58).clamp(0.0, 1.0)
     }
 

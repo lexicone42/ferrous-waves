@@ -364,15 +364,22 @@ impl AnalysisEngine {
             };
             spectral_flatness.push(flatness);
 
-            // Spectral flux
+            // Spectral flux (normalized by frame energy for amplitude independence)
+            // Without normalization, louder recordings produce proportionally higher
+            // flux values, causing 24-bit / high-level recordings to trigger 3x more
+            // onset detections than quieter ones with the same musical content.
             if frame_idx > 0 {
                 let prev_frame = spectrogram.column(frame_idx - 1);
-                let flux: f32 = frame
+                let raw_flux: f32 = frame
                     .iter()
                     .zip(prev_frame.iter())
                     .map(|(&curr, &prev)| (curr - prev).max(0.0).powi(2))
                     .sum();
-                spectral_flux.push(flux.sqrt());
+                // Normalize by geometric mean of frame energies
+                let frame_energy: f32 = frame.iter().map(|&m| m * m).sum::<f32>();
+                let prev_energy: f32 = prev_frame.iter().map(|&m| m * m).sum::<f32>();
+                let norm = (frame_energy * prev_energy).sqrt().max(1e-10);
+                spectral_flux.push(raw_flux.sqrt() / norm.sqrt());
             }
         }
 
@@ -447,21 +454,50 @@ impl AnalysisEngine {
             onset_detector.detect_onsets(&spectral_flux, self.hop_size, audio.buffer.sample_rate);
 
         let beat_tracker = BeatTracker::new();
-        let tempo = beat_tracker.estimate_tempo(&onsets);
+        // Primary: autocorrelation of onset envelope (continuous BPM, no quantization)
+        // Fallback: IOI-based estimation from onset times
+        let tempo = beat_tracker
+            .estimate_tempo_from_envelope(&spectral_flux, self.hop_size, audio.buffer.sample_rate)
+            .or_else(|| beat_tracker.estimate_tempo(&onsets));
         let beats = tempo
             .map(|t| beat_tracker.track_beats(&onsets, t))
             .unwrap_or_default();
 
-        // Calculate tempo stability
-        let tempo_stability = if beats.len() > 2 {
-            let intervals: Vec<f32> = beats.windows(2).map(|w| w[1] - w[0]).collect();
-            let mean_interval = intervals.iter().sum::<f32>() / intervals.len() as f32;
-            let variance = intervals
-                .iter()
-                .map(|&i| (i - mean_interval).powi(2))
-                .sum::<f32>()
-                / intervals.len() as f32;
-            1.0 / (1.0 + variance.sqrt())
+        // Calculate tempo stability by measuring how well actual onsets align with
+        // the beat grid. Mean normalized onset-to-beat distance: 0 = perfect alignment,
+        // 0.5 = maximally misaligned. Map to 0-1 stability score.
+        let tempo_stability = if !beats.is_empty() && !onsets.is_empty() {
+            let beat_period = if beats.len() > 1 {
+                beats[1] - beats[0]
+            } else {
+                tempo.unwrap_or(120.0).recip() * 60.0
+            };
+
+            if beat_period > 0.0 {
+                let mut total_deviation = 0.0_f32;
+                let mut count = 0;
+
+                for &beat in &beats {
+                    // Find nearest onset to this beat
+                    let min_dist = onsets
+                        .iter()
+                        .map(|&o| (o - beat).abs())
+                        .fold(f32::MAX, f32::min);
+                    // Normalize by beat period (0 = on beat, 0.5 = maximally off)
+                    total_deviation += (min_dist / beat_period).min(0.5);
+                    count += 1;
+                }
+
+                if count > 0 {
+                    let mean_dev = total_deviation / count as f32;
+                    // Map: mean_dev=0 → stability=1.0, mean_dev=0.25 → stability=0.0
+                    (1.0 - mean_dev / 0.25).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
         } else {
             0.0
         };

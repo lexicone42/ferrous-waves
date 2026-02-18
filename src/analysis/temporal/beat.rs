@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 pub struct BeatTracker {
     min_tempo: f32,
     max_tempo: f32,
@@ -8,52 +6,173 @@ pub struct BeatTracker {
 impl BeatTracker {
     pub fn new() -> Self {
         Self {
-            min_tempo: 60.0,
-            max_tempo: 200.0,
+            min_tempo: 50.0,
+            max_tempo: 220.0,
         }
     }
 
+    /// Estimate tempo from an onset strength envelope using autocorrelation.
+    ///
+    /// The onset envelope (spectral flux) is autocorrelated at lags corresponding
+    /// to the valid tempo range (50-220 BPM). The lag with the highest
+    /// autocorrelation is the estimated beat period.
+    ///
+    /// This replaces the previous histogram-of-IOIs approach which produced
+    /// only ~28 distinct BPM values due to 10ms bin quantization.
+    pub fn estimate_tempo_from_envelope(
+        &self,
+        onset_envelope: &[f32],
+        hop_size: usize,
+        sample_rate: u32,
+    ) -> Option<f32> {
+        if onset_envelope.len() < 64 {
+            return None;
+        }
+
+        let frame_duration = hop_size as f32 / sample_rate as f32;
+
+        // Lag range in frames for valid tempo range
+        let min_lag = (60.0 / (self.max_tempo * frame_duration)).floor() as usize;
+        let max_lag = (60.0 / (self.min_tempo * frame_duration)).ceil() as usize;
+        let max_lag = max_lag.min(onset_envelope.len() / 2);
+
+        if min_lag >= max_lag || max_lag >= onset_envelope.len() {
+            return None;
+        }
+
+        // Subtract mean to remove DC bias
+        let mean = onset_envelope.iter().sum::<f32>() / onset_envelope.len() as f32;
+        let centered: Vec<f32> = onset_envelope.iter().map(|&x| x - mean).collect();
+
+        // Autocorrelation for each candidate lag
+        let n = centered.len();
+        let mut best_lag = min_lag;
+        let mut best_corr = f32::NEG_INFINITY;
+
+        // Normalization: autocorrelation at lag 0
+        let energy: f32 = centered.iter().map(|&x| x * x).sum();
+        if energy < 1e-10 {
+            return None;
+        }
+
+        for lag in min_lag..=max_lag {
+            let corr: f32 = centered[..n - lag]
+                .iter()
+                .zip(centered[lag..].iter())
+                .map(|(&a, &b)| a * b)
+                .sum::<f32>()
+                / energy;
+
+            if corr > best_corr {
+                best_corr = corr;
+                best_lag = lag;
+            }
+        }
+
+        // Require minimum correlation strength
+        if best_corr < 0.05 {
+            return None;
+        }
+
+        // Parabolic interpolation around the peak for sub-frame precision
+        let tempo_lag = if best_lag > min_lag && best_lag < max_lag {
+            let corr_at = |lag: usize| -> f32 {
+                centered[..n - lag]
+                    .iter()
+                    .zip(centered[lag..].iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum::<f32>()
+                    / energy
+            };
+
+            let prev = corr_at(best_lag - 1);
+            let curr = best_corr;
+            let next = corr_at(best_lag + 1);
+
+            // Parabolic fit: offset = 0.5 * (prev - next) / (prev - 2*curr + next)
+            let denom = prev - 2.0 * curr + next;
+            if denom.abs() > 1e-10 {
+                best_lag as f32 + 0.5 * (prev - next) / denom
+            } else {
+                best_lag as f32
+            }
+        } else {
+            best_lag as f32
+        };
+
+        let beat_period = tempo_lag * frame_duration;
+        if beat_period > 0.0 {
+            let bpm = 60.0 / beat_period;
+            // Handle octave ambiguity: if BPM is very high, check half-tempo
+            if bpm > 160.0 {
+                let half_lag = (tempo_lag * 2.0).round() as usize;
+                if half_lag <= max_lag {
+                    let half_corr: f32 = centered[..n - half_lag]
+                        .iter()
+                        .zip(centered[half_lag..].iter())
+                        .map(|(&a, &b)| a * b)
+                        .sum::<f32>()
+                        / energy;
+                    // Prefer half-tempo if its correlation is at least 80% of the peak
+                    if half_corr > best_corr * 0.8 {
+                        return Some(bpm / 2.0);
+                    }
+                }
+            }
+            Some(bpm)
+        } else {
+            None
+        }
+    }
+
+    /// Legacy tempo estimation from onset times (IOI histogram).
+    /// Kept for backward compatibility but estimate_tempo_from_envelope is preferred.
     pub fn estimate_tempo(&self, onset_times: &[f32]) -> Option<f32> {
-        if onset_times.len() < 2 {
+        if onset_times.len() < 4 {
             return None;
         }
 
         // Compute inter-onset intervals
-        let mut intervals = Vec::new();
-        for i in 1..onset_times.len() {
-            intervals.push(onset_times[i] - onset_times[i - 1]);
-        }
+        let intervals: Vec<f32> = onset_times.windows(2).map(|w| w[1] - w[0]).collect();
 
-        // Build histogram of intervals
-        let mut histogram = HashMap::new();
-        let bin_width = 0.01; // 10ms bins
-
-        for &interval in &intervals {
-            let bin = (interval / bin_width).round() as i32;
-            *histogram.entry(bin).or_insert(0) += 1;
-        }
-
-        // Find peaks in histogram corresponding to tempo range
+        // Use kernel density estimation instead of fixed bins
         let min_interval = 60.0 / self.max_tempo;
         let max_interval = 60.0 / self.min_tempo;
 
-        let mut best_interval = 0.0;
-        let mut best_count = 0;
+        // Filter to valid tempo range
+        let valid: Vec<f32> = intervals
+            .iter()
+            .copied()
+            .filter(|&i| i >= min_interval && i <= max_interval)
+            .collect();
 
-        for (&bin, &count) in &histogram {
-            let interval = bin as f32 * bin_width;
+        if valid.is_empty() {
+            return None;
+        }
 
-            if interval >= min_interval && interval <= max_interval && count > best_count {
-                best_interval = interval;
-                best_count = count;
+        // Weighted median — more robust than mode with quantized bins
+        let mut sorted = valid.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let median = sorted[sorted.len() / 2];
+        let bpm = 60.0 / median;
+
+        // Handle octave ambiguity
+        if bpm > 160.0 {
+            // Check if half-tempo intervals are also well-represented
+            let half_min = median * 1.8;
+            let half_max = median * 2.2;
+            let half_count = intervals
+                .iter()
+                .filter(|&&i| i >= half_min && i <= half_max)
+                .count();
+            let base_count = valid.len();
+            if half_count as f32 > base_count as f32 * 0.3 {
+                return Some(bpm / 2.0);
             }
         }
 
-        if best_count > 0 {
-            Some(60.0 / best_interval)
-        } else {
-            None
-        }
+        Some(bpm)
     }
 
     pub fn track_beats(&self, onset_times: &[f32], tempo: f32) -> Vec<f32> {

@@ -1,6 +1,8 @@
 use ndarray::{s, Array2};
 
 pub struct OnsetDetector {
+    /// Multiplicative threshold: a peak must exceed local_mean * threshold to be an onset.
+    /// Default 1.5 means peak must be 50% above local average.
     threshold: f32,
     pre_max: usize,
     post_max: usize,
@@ -11,7 +13,7 @@ pub struct OnsetDetector {
 impl OnsetDetector {
     pub fn new() -> Self {
         Self {
-            threshold: 0.3,
+            threshold: 1.5,
             pre_max: 3,
             post_max: 3,
             pre_avg: 30,
@@ -19,6 +21,9 @@ impl OnsetDetector {
         }
     }
 
+    /// Compute normalized spectral flux from a spectrogram.
+    /// Each flux value is normalized by frame energy so that amplitude/bit-depth
+    /// does not affect the magnitude of detected changes.
     pub fn spectral_flux(&self, spectrogram: &Array2<f32>) -> Vec<f32> {
         let num_frames = spectrogram.shape()[1];
         let mut flux = vec![0.0; num_frames];
@@ -27,20 +32,21 @@ impl OnsetDetector {
             let prev_frame = spectrogram.slice(s![.., i - 1]);
             let curr_frame = spectrogram.slice(s![.., i]);
 
-            let diff: f32 = curr_frame
+            let raw: f32 = curr_frame
                 .iter()
                 .zip(prev_frame.iter())
                 .map(|(&curr, &prev)| {
                     let d = curr - prev;
-                    if d > 0.0 {
-                        d
-                    } else {
-                        0.0
-                    } // Half-wave rectification
+                    if d > 0.0 { d } else { 0.0 }
                 })
                 .sum();
 
-            *flux_value = diff;
+            // Normalize by geometric mean of frame energies
+            let curr_energy: f32 = curr_frame.iter().map(|&m| m * m).sum::<f32>();
+            let prev_energy: f32 = prev_frame.iter().map(|&m| m * m).sum::<f32>();
+            let norm = (curr_energy * prev_energy).sqrt().max(1e-10).sqrt();
+
+            *flux_value = raw / norm;
         }
 
         flux
@@ -80,7 +86,7 @@ impl OnsetDetector {
                 continue;
             }
 
-            // Compute adaptive threshold
+            // Compute adaptive threshold from local context
             let pre_start = i.saturating_sub(self.pre_avg);
             let pre_end = i.saturating_sub(1);
             let post_start = (i + 1).min(len - 1);
@@ -107,8 +113,9 @@ impl OnsetDetector {
                 mean /= count as f32;
             }
 
-            // Check if peak is above threshold
-            if signal[i] > mean + self.threshold {
+            // Multiplicative threshold: peak must exceed local mean by threshold ratio.
+            // With normalized flux, this is amplitude-independent.
+            if signal[i] > mean * self.threshold {
                 peaks.push(i);
             }
         }
