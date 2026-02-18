@@ -57,6 +57,45 @@ pub struct SpectralAnalysis {
     pub sub_band_energy_mid: Vec<f32>,
     pub sub_band_energy_high: Vec<f32>,
     pub sub_band_energy_presence: Vec<f32>,
+
+    // Spectral shape descriptors (higher moments)
+    /// Spectral spread: std dev of spectrum around centroid (Hz)
+    pub spectral_spread: Vec<f32>,
+    /// Spectral skewness: asymmetry of spectrum (positive = energy below centroid)
+    pub spectral_skewness: Vec<f32>,
+    /// Spectral kurtosis: peakedness of spectrum (high = tonal, low = noise-like)
+    pub spectral_kurtosis: Vec<f32>,
+    /// Spectral entropy: Shannon entropy of normalized spectrum (0 = pure tone, high = noise)
+    pub spectral_entropy: Vec<f32>,
+    /// Spectral slope: tilt of log-magnitude vs log-frequency (dB/octave proxy)
+    pub spectral_slope: Vec<f32>,
+
+    // Spectral contrast (per octave band, peak-valley difference)
+    /// 7 octave bands: [<100, 100-200, 200-400, 400-800, 800-1600, 1600-3200, 3200+] Hz
+    /// Each inner Vec has one value per frame. High contrast = tonal, low = noise.
+    pub spectral_contrast: Vec<Vec<f32>>,
+
+    // Sub-band spectral flux (per-band change rate)
+    pub sub_band_flux_bass: Vec<f32>,
+    pub sub_band_flux_mid: Vec<f32>,
+    pub sub_band_flux_high: Vec<f32>,
+
+    // Chromagram and harmonic features
+    /// 12-bin pitch class profile per frame (C, C#, D, ..., B)
+    pub chroma: Vec<Vec<f32>>,
+    /// 6D Tonnetz (tonal centroid) per frame — encodes harmonic motion
+    pub tonnetz: Vec<Vec<f32>>,
+
+    // Beat-synchronous rhythm features
+    /// Sub-band onset pattern at 16th-note resolution (3 bands × 16 positions)
+    /// Outer: [bass_pattern, mid_pattern, high_pattern], inner: 16 values each
+    pub beat_onset_pattern: Vec<Vec<f32>>,
+    /// Syncopation index (0 = on-beat, high = off-beat emphasis)
+    pub syncopation: f32,
+    /// Pulse clarity (0 = no clear beat, 1 = strong regular pulse)
+    pub pulse_clarity: f32,
+    /// Offbeat energy ratio in mid band (high = reggae skank)
+    pub offbeat_ratio: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +306,18 @@ impl AnalysisEngine {
         let mut sub_band_energy_mid = Vec::with_capacity(num_frames);
         let mut sub_band_energy_high = Vec::with_capacity(num_frames);
         let mut sub_band_energy_presence = Vec::with_capacity(num_frames);
+        let mut spectral_spread = Vec::with_capacity(num_frames);
+        let mut spectral_skewness = Vec::with_capacity(num_frames);
+        let mut spectral_kurtosis = Vec::with_capacity(num_frames);
+        let mut spectral_entropy = Vec::with_capacity(num_frames);
+        let mut spectral_slope = Vec::with_capacity(num_frames);
+        let num_contrast_bands = 7;
+        let mut spectral_contrast: Vec<Vec<f32>> = (0..num_contrast_bands)
+            .map(|_| Vec::with_capacity(num_frames))
+            .collect();
+        let mut sub_band_flux_bass = Vec::with_capacity(num_frames);
+        let mut sub_band_flux_mid = Vec::with_capacity(num_frames);
+        let mut sub_band_flux_high = Vec::with_capacity(num_frames);
 
         // Pre-compute bin boundaries for sub-band energy
         let sr = audio.buffer.sample_rate as f32;
@@ -274,6 +325,25 @@ impl AnalysisEngine {
         let bin_mid_end = (2000.0 * self.fft_size as f32 / sr).ceil() as usize;
         let bin_high_end = (8000.0 * self.fft_size as f32 / sr).ceil() as usize;
         let bin_bass_start = (20.0 * self.fft_size as f32 / sr).floor() as usize;
+
+        // Spectral contrast band boundaries (7 octave bands)
+        let contrast_edges: Vec<usize> = [0.0_f32, 100.0, 200.0, 400.0, 800.0, 1600.0, 3200.0, sr / 2.0]
+            .iter()
+            .map(|&f| (f * self.fft_size as f32 / sr).round() as usize)
+            .collect();
+
+        // Pre-compute log-frequency for spectral slope regression
+        let log_freqs: Vec<f32> = (0..num_bins)
+            .map(|bin| {
+                let f = (bin as f32 * sr / self.fft_size as f32).max(1.0);
+                f.ln()
+            })
+            .collect();
+        let log_freq_mean: f32 = log_freqs.iter().sum::<f32>() / num_bins as f32;
+        let log_freq_var: f32 = log_freqs
+            .iter()
+            .map(|&lf| (lf - log_freq_mean).powi(2))
+            .sum::<f32>();
 
         for frame_idx in 0..num_frames {
             let frame = spectrogram.column(frame_idx);
@@ -380,6 +450,103 @@ impl AnalysisEngine {
                 let prev_energy: f32 = prev_frame.iter().map(|&m| m * m).sum::<f32>();
                 let norm = (frame_energy * prev_energy).sqrt().max(1e-10);
                 spectral_flux.push(raw_flux.sqrt() / norm.sqrt());
+
+                // Sub-band spectral flux (per-band change rate)
+                let prev_frame = spectrogram.column(frame_idx - 1);
+                let bass_flux: f32 = frame.iter().skip(bin_bass_start).take(bin_bass_end.saturating_sub(bin_bass_start))
+                    .zip(prev_frame.iter().skip(bin_bass_start).take(bin_bass_end.saturating_sub(bin_bass_start)))
+                    .map(|(&c, &p)| (c - p).max(0.0).powi(2))
+                    .sum::<f32>().sqrt();
+                let mid_flux: f32 = frame.iter().skip(bin_bass_end).take(bin_mid_end.saturating_sub(bin_bass_end))
+                    .zip(prev_frame.iter().skip(bin_bass_end).take(bin_mid_end.saturating_sub(bin_bass_end)))
+                    .map(|(&c, &p)| (c - p).max(0.0).powi(2))
+                    .sum::<f32>().sqrt();
+                let high_flux: f32 = frame.iter().skip(bin_mid_end).take(bin_high_end.saturating_sub(bin_mid_end))
+                    .zip(prev_frame.iter().skip(bin_mid_end).take(bin_high_end.saturating_sub(bin_mid_end)))
+                    .map(|(&c, &p)| (c - p).max(0.0).powi(2))
+                    .sum::<f32>().sqrt();
+                sub_band_flux_bass.push(bass_flux);
+                sub_band_flux_mid.push(mid_flux);
+                sub_band_flux_high.push(high_flux);
+            }
+
+            // Spectral spread (second central moment around centroid) — in Hz, not normalized
+            if magnitude_sum > 0.0 {
+                let mut m2 = 0.0_f32;
+                let mut m3 = 0.0_f32;
+                let mut m4 = 0.0_f32;
+                for (bin, &mag) in frame.iter().enumerate() {
+                    let freq = bin as f32 * sr / self.fft_size as f32;
+                    let diff = freq - centroid_val;
+                    let p = mag / magnitude_sum;
+                    let d2 = diff * diff;
+                    m2 += p * d2;
+                    m3 += p * d2 * diff;
+                    m4 += p * d2 * d2;
+                }
+                let spread = m2.sqrt();
+                spectral_spread.push(spread);
+                // Skewness = m3 / spread^3
+                let s3 = spread * spread * spread;
+                spectral_skewness.push(if s3 > 1e-10 { m3 / s3 } else { 0.0 });
+                // Excess kurtosis = m4 / spread^4 - 3
+                let s4 = s3 * spread;
+                spectral_kurtosis.push(if s4 > 1e-10 { m4 / s4 - 3.0 } else { 0.0 });
+            } else {
+                spectral_spread.push(0.0);
+                spectral_skewness.push(0.0);
+                spectral_kurtosis.push(0.0);
+            }
+
+            // Spectral entropy: -sum(p * ln(p)) normalized by ln(N)
+            if magnitude_sum > 0.0 {
+                let n_f = num_bins as f32;
+                let mut ent = 0.0_f32;
+                for &mag in frame.iter() {
+                    let p = mag / magnitude_sum;
+                    if p > 1e-10 {
+                        ent -= p * p.ln();
+                    }
+                }
+                let max_ent = n_f.ln();
+                spectral_entropy.push(if max_ent > 0.0 { ent / max_ent } else { 0.0 });
+            } else {
+                spectral_entropy.push(0.0);
+            }
+
+            // Spectral slope: linear regression of log(magnitude) vs log(frequency)
+            // slope = cov(log_freq, log_mag) / var(log_freq)
+            {
+                let log_mag_mean: f32 = frame.iter()
+                    .map(|&m| (m.max(1e-10)).ln())
+                    .sum::<f32>() / num_bins as f32;
+                let cov: f32 = frame.iter().enumerate()
+                    .map(|(bin, &m)| (log_freqs[bin] - log_freq_mean) * ((m.max(1e-10)).ln() - log_mag_mean))
+                    .sum();
+                spectral_slope.push(if log_freq_var > 1e-10 { cov / log_freq_var } else { 0.0 });
+            }
+
+            // Spectral contrast: per octave-band, peak - valley of sorted magnitudes
+            for band in 0..num_contrast_bands {
+                let start = contrast_edges[band].min(num_bins);
+                let end = contrast_edges[band + 1].min(num_bins);
+                if end > start {
+                    let mut band_mags: Vec<f32> = frame.iter()
+                        .skip(start).take(end - start)
+                        .copied().collect();
+                    band_mags.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let n = band_mags.len();
+                    let top_frac = (n as f32 * 0.2).ceil() as usize;
+                    let peak: f32 = band_mags[n.saturating_sub(top_frac)..].iter().sum::<f32>()
+                        / top_frac.max(1) as f32;
+                    let valley: f32 = band_mags[..top_frac.min(n)].iter().sum::<f32>()
+                        / top_frac.max(1) as f32;
+                    // Log-scale contrast (dB-like)
+                    let contrast = ((peak + 1e-10) / (valley + 1e-10)).log10();
+                    spectral_contrast[band].push(contrast);
+                } else {
+                    spectral_contrast[band].push(0.0);
+                }
             }
         }
 
@@ -448,6 +615,72 @@ impl AnalysisEngine {
             coefficients
         };
 
+        // Chromagram: map STFT magnitude to 12 pitch classes (C, C#, D, ..., B)
+        let chroma = {
+            let mut chroma_vecs: Vec<Vec<f32>> = (0..12).map(|_| Vec::with_capacity(num_frames)).collect();
+            // Pre-compute bin → pitch class mapping with harmonic weighting
+            let mut bin_to_chroma: Vec<(usize, f32)> = Vec::with_capacity(num_bins);
+            for bin in 0..num_bins {
+                let freq = bin as f32 * sr / self.fft_size as f32;
+                if freq < 20.0 || freq > 8000.0 {
+                    bin_to_chroma.push((0, 0.0));
+                    continue;
+                }
+                // MIDI note = 69 + 12*log2(freq/440)
+                let midi = 69.0 + 12.0 * (freq / 440.0).log2();
+                let chroma_bin = ((midi.round() as i32 % 12 + 12) % 12) as usize;
+                bin_to_chroma.push((chroma_bin, 1.0));
+            }
+            for frame_idx in 0..num_frames {
+                let frame = spectrogram.column(frame_idx);
+                let mut chroma_frame = [0.0_f32; 12];
+                for (bin, &mag) in frame.iter().enumerate() {
+                    let (pc, weight) = bin_to_chroma[bin];
+                    if weight > 0.0 {
+                        chroma_frame[pc] += mag * mag; // energy weighting
+                    }
+                }
+                // L1 normalize
+                let total: f32 = chroma_frame.iter().sum::<f32>().max(1e-10);
+                for (i, cv) in chroma_vecs.iter_mut().enumerate() {
+                    cv.push(chroma_frame[i] / total);
+                }
+            }
+            chroma_vecs
+        };
+
+        // Tonnetz: 6D tonal centroid from chroma (captures harmonic motion)
+        // Dimensions: fifths (sin/cos), minor thirds (sin/cos), major thirds (sin/cos)
+        let tonnetz = {
+            let mut tonnetz_vecs: Vec<Vec<f32>> = (0..6).map(|_| Vec::with_capacity(num_frames)).collect();
+            // Angular mapping: pitch class k maps to angles on three circles
+            let angles: Vec<[f32; 6]> = (0..12).map(|k| {
+                let kf = k as f32;
+                [
+                    (kf * 7.0 * std::f32::consts::PI / 6.0).sin(), // fifths sin
+                    (kf * 7.0 * std::f32::consts::PI / 6.0).cos(), // fifths cos
+                    (kf * 3.0 * std::f32::consts::PI / 6.0).sin(), // minor thirds sin
+                    (kf * 3.0 * std::f32::consts::PI / 6.0).cos(), // minor thirds cos
+                    (kf * 4.0 * std::f32::consts::PI / 6.0).sin(), // major thirds sin
+                    (kf * 4.0 * std::f32::consts::PI / 6.0).cos(), // major thirds cos
+                ]
+            }).collect();
+
+            for frame_idx in 0..num_frames {
+                let mut t = [0.0_f32; 6];
+                for pc in 0..12 {
+                    let c = chroma[pc][frame_idx];
+                    for d in 0..6 {
+                        t[d] += c * angles[pc][d];
+                    }
+                }
+                for (d, tv) in tonnetz_vecs.iter_mut().enumerate() {
+                    tv.push(t[d]);
+                }
+            }
+            tonnetz_vecs
+        };
+
         // Temporal analysis
         let onset_detector = OnsetDetector::new();
         let onsets =
@@ -500,6 +733,107 @@ impl AnalysisEngine {
             }
         } else {
             0.0
+        };
+
+        // Beat-synchronous rhythm features
+        let (beat_onset_pattern, syncopation, pulse_clarity, offbeat_ratio) = {
+            if beats.len() >= 4 && !onsets.is_empty() {
+                let beat_period = {
+                    let intervals: Vec<f32> = beats.windows(2).map(|w| w[1] - w[0]).collect();
+                    intervals.iter().sum::<f32>() / intervals.len() as f32
+                };
+                let sixteenth = beat_period / 4.0; // 16th-note duration
+
+                // Quantize onsets to 16th-note grid positions (0-15) within each bar (4 beats)
+                let bar_length = beat_period * 4.0;
+                let mut bass_pattern = [0.0_f32; 16];
+                let mut mid_pattern = [0.0_f32; 16];
+                let mut high_pattern = [0.0_f32; 16];
+
+                // For each onset, find its position in the nearest bar
+                let bar_start = beats[0]; // first beat defines bar alignment
+                for &onset in &onsets {
+                    if onset < bar_start { continue; }
+                    let bar_pos = (onset - bar_start) % bar_length;
+                    let grid_pos = ((bar_pos / sixteenth).round() as usize) % 16;
+
+                    // Get sub-band energy at this onset time from the spectrogram
+                    let frame_idx = ((onset * sr) as usize / self.hop_size).min(num_frames.saturating_sub(1));
+                    let frame = spectrogram.column(frame_idx);
+                    let bass_e: f32 = frame.iter().skip(bin_bass_start).take(bin_bass_end.saturating_sub(bin_bass_start)).sum();
+                    let mid_e: f32 = frame.iter().skip(bin_bass_end).take(bin_mid_end.saturating_sub(bin_bass_end)).sum();
+                    let high_e: f32 = frame.iter().skip(bin_mid_end).take(bin_high_end.saturating_sub(bin_mid_end)).sum();
+
+                    bass_pattern[grid_pos] += bass_e;
+                    mid_pattern[grid_pos] += mid_e;
+                    high_pattern[grid_pos] += high_e;
+                }
+
+                // Normalize by number of bars
+                let bar_count = ((onsets.last().unwrap_or(&0.0) - bar_start) / bar_length).ceil().max(1.0);
+                for p in bass_pattern.iter_mut() { *p /= bar_count; }
+                for p in mid_pattern.iter_mut() { *p /= bar_count; }
+                for p in high_pattern.iter_mut() { *p /= bar_count; }
+
+                // Syncopation: weighted off-beat emphasis
+                // Metrical weights: beat 1 = 1.0, beat 3 = 0.75, beats 2/4 = 0.5, 8th = 0.25, 16th = 0.125
+                let metrical_weights: [f32; 16] = [
+                    1.0, 0.125, 0.25, 0.125, 0.5, 0.125, 0.25, 0.125,
+                    0.75, 0.125, 0.25, 0.125, 0.5, 0.125, 0.25, 0.125,
+                ];
+                let total_energy: f32 = mid_pattern.iter().sum::<f32>();
+                let sync_val = if total_energy > 1e-10 {
+                    let weighted: f32 = mid_pattern.iter().enumerate()
+                        .map(|(i, &e)| e * (1.0 - metrical_weights[i]))
+                        .sum();
+                    weighted / total_energy
+                } else {
+                    0.0
+                };
+
+                // Offbeat ratio: energy on offbeats (positions 2,6,10,14) vs downbeats (0,4,8,12)
+                // in mid band — high ratio indicates reggae skank
+                let offbeat_positions = [2, 6, 10, 14]; // "and" of each beat
+                let downbeat_positions = [0, 4, 8, 12];
+                let offbeat_e: f32 = offbeat_positions.iter().map(|&i| mid_pattern[i]).sum();
+                let downbeat_e: f32 = downbeat_positions.iter().map(|&i| mid_pattern[i]).sum();
+                let offbeat_r = if downbeat_e > 1e-10 {
+                    offbeat_e / downbeat_e
+                } else if offbeat_e > 1e-10 {
+                    10.0
+                } else {
+                    1.0
+                };
+
+                // Pulse clarity: autocorrelation of onset strength at beat period
+                let onset_sr = sr / self.hop_size as f32;
+                let beat_lag = (beat_period * onset_sr).round() as usize;
+                let pulse_c = if beat_lag > 0 && spectral_flux.len() > beat_lag * 2 {
+                    let n = spectral_flux.len() - beat_lag;
+                    let mean: f32 = spectral_flux.iter().sum::<f32>() / spectral_flux.len() as f32;
+                    let var: f32 = spectral_flux.iter().map(|&v| (v - mean).powi(2)).sum::<f32>();
+                    if var > 1e-10 {
+                        let autocorr: f32 = spectral_flux[..n].iter()
+                            .zip(spectral_flux[beat_lag..].iter())
+                            .map(|(&a, &b)| (a - mean) * (b - mean))
+                            .sum();
+                        (autocorr / var).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+
+                let patterns = vec![
+                    bass_pattern.to_vec(),
+                    mid_pattern.to_vec(),
+                    high_pattern.to_vec(),
+                ];
+                (patterns, sync_val, pulse_c, offbeat_r)
+            } else {
+                (vec![vec![0.0; 16]; 3], 0.0, 0.0, 1.0)
+            }
         };
 
         // Generate visualizations (skip if configured)
@@ -859,6 +1193,21 @@ impl AnalysisEngine {
                 sub_band_energy_mid,
                 sub_band_energy_high,
                 sub_band_energy_presence,
+                spectral_spread,
+                spectral_skewness,
+                spectral_kurtosis,
+                spectral_entropy,
+                spectral_slope,
+                spectral_contrast,
+                sub_band_flux_bass,
+                sub_band_flux_mid,
+                sub_band_flux_high,
+                chroma,
+                tonnetz,
+                beat_onset_pattern,
+                syncopation,
+                pulse_clarity,
+                offbeat_ratio,
             },
             temporal: TemporalAnalysis {
                 tempo,
