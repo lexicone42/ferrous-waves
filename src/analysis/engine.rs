@@ -903,17 +903,28 @@ impl AnalysisEngine {
             .map(|t| beat_tracker.track_beats(&onsets, t))
             .unwrap_or_default();
 
-        // Tempo stability via inter-onset-interval coefficient of variation.
-        // CV = std(IOI) / mean(IOI). Low CV → steady tempo, high CV → rubato/free.
-        // Map CV to 0-1 stability: CV=0 → 1.0 (perfect), CV≥0.5 → 0.0 (free time).
-        let tempo_stability = if onsets.len() >= 4 {
-            let ioi: Vec<f32> = onsets.windows(2).map(|w| w[1] - w[0]).collect();
-            let mean_ioi = ioi.iter().sum::<f32>() / ioi.len() as f32;
-            if mean_ioi > 1e-6 {
-                let var = ioi.iter().map(|&x| (x - mean_ioi).powi(2)).sum::<f32>()
-                    / ioi.len() as f32;
-                let cv = var.sqrt() / mean_ioi;
-                (1.0 - cv / 0.5).clamp(0.0, 1.0)
+        // Tempo stability via inter-beat-interval coefficient of variation.
+        // Uses DP-tracked beat positions (regularized but tempo-responsive).
+        // CV = std(IBI) / mean(IBI). Low CV → steady tempo, high CV → rubato/free.
+        // Map CV to 0-1 stability: CV=0 → 1.0 (perfect), CV≥0.3 → 0.0 (free time).
+        // Threshold 0.3 chosen for live jam bands: tight band ~0.05-0.10, free improv 0.30+.
+        let tempo_stability = if beats.len() >= 4 {
+            let ibi: Vec<f32> = beats.windows(2).map(|w| w[1] - w[0]).collect();
+            // Filter outlier intervals (beat-doubling/halving artifacts):
+            // keep only intervals within 50% of the median
+            let mut sorted_ibi = ibi.clone();
+            sorted_ibi.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = sorted_ibi[sorted_ibi.len() / 2];
+            let filtered: Vec<f32> = ibi.iter()
+                .copied()
+                .filter(|&x| x > median * 0.5 && x < median * 1.5)
+                .collect();
+            if filtered.len() >= 3 {
+                let mean = filtered.iter().sum::<f32>() / filtered.len() as f32;
+                let var = filtered.iter().map(|&x| (x - mean).powi(2)).sum::<f32>()
+                    / filtered.len() as f32;
+                let cv = var.sqrt() / mean;
+                (1.0 - cv / 0.3).clamp(0.0, 1.0)
             } else {
                 0.0
             }
