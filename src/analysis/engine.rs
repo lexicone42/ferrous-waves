@@ -152,6 +152,34 @@ pub struct SpectralAnalysis {
     /// Average diagonal bandwidth of chroma self-similarity matrix
     /// Wide = repetitive harmony (pop), narrow = through-composed (jazz/jams)
     pub chroma_self_similarity_bandwidth: f32,
+
+    // === New features (v14) ===
+
+    // Source separation proxy
+    /// Harmonic-to-total energy ratio from median-filtered spectrogram (Fitzgerald 2010).
+    /// 1.0 = purely harmonic (sustained tones), 0.0 = purely percussive (transients).
+    /// Helps distinguish melodic passages from drum-heavy sections.
+    pub harmonic_percussive_ratio: f32,
+
+    // Tonal complexity
+    /// Shannon entropy of the mean chromagram (12-bin pitch class profile).
+    /// Low = simple tonality (few pitch classes), high = chromatic/atonal (all pitch classes).
+    /// Max = ln(12) ≈ 2.485 for uniform distribution.
+    pub chromagram_entropy: f32,
+
+    // Spectral contrast shape
+    /// Linear regression slope across 7 octave-band contrast values.
+    /// Positive = contrast increases with frequency, negative = decreases.
+    pub spectral_contrast_slope: f32,
+    /// Range (max - min) of 7 octave-band contrast values.
+    /// High = uneven spectral texture, low = balanced contrast across bands.
+    pub spectral_contrast_range: f32,
+
+    // Onset strength temporal shape (DCT of onset envelope)
+    /// First 4 DCT coefficients of the spectral flux time series.
+    /// Captures the *shape* of rhythmic intensity over time:
+    /// [0] = overall level, [1] = linear trend, [2] = U-shape/arch, [3] = oscillation.
+    pub onset_strength_contour: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1271,6 +1299,134 @@ impl AnalysisEngine {
             }
         };
 
+        // === v14 features ===
+
+        // Harmonic-Percussive Ratio via median filtering (Fitzgerald 2010)
+        // Horizontal median → harmonic, vertical median → percussive
+        let harmonic_percussive_ratio = {
+            let kernel = 17; // median filter length (odd, ~17 frames ≈ 0.4s at typical hop)
+            let half = kernel / 2;
+            let mut harmonic_energy = 0.0_f64;
+            let mut total_energy = 0.0_f64;
+
+            // For each frequency bin, apply horizontal median filter across time
+            // to extract the harmonic component (sustained tones = horizontal lines)
+            for bin in 0..num_bins {
+                for t in 0..num_frames {
+                    let orig = spectrogram[(bin, t)] as f64;
+                    total_energy += orig * orig;
+
+                    // Horizontal median (time-direction) for harmonic
+                    let t_start = if t >= half { t - half } else { 0 };
+                    let t_end = (t + half + 1).min(num_frames);
+                    let mut h_window: Vec<f32> = (t_start..t_end)
+                        .map(|ti| spectrogram[(bin, ti)])
+                        .collect();
+                    h_window.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+                    let h_median = h_window[h_window.len() / 2] as f64;
+
+                    harmonic_energy += h_median * h_median;
+                }
+            }
+
+            if total_energy > 1e-10 {
+                (harmonic_energy / total_energy).min(1.0) as f32
+            } else {
+                0.5 // no energy = neutral
+            }
+        };
+
+        // Chromagram entropy: Shannon entropy of mean chroma vector
+        let chromagram_entropy = {
+            if chroma.len() == 12 && !chroma[0].is_empty() {
+                // Compute mean chroma across all frames
+                let nf = chroma[0].len();
+                let mut mean_chroma = [0.0_f32; 12];
+                for c in 0..12 {
+                    mean_chroma[c] = chroma[c].iter().sum::<f32>() / nf as f32;
+                }
+
+                // Normalize to probability distribution
+                let total: f32 = mean_chroma.iter().sum();
+                if total > 1e-10 {
+                    let probs: Vec<f32> = mean_chroma.iter().map(|&v| v / total).collect();
+                    // Shannon entropy
+                    let entropy: f32 = probs.iter()
+                        .filter(|&&p| p > 1e-10)
+                        .map(|&p| -p * p.ln())
+                        .sum();
+                    entropy
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        };
+
+        // Spectral contrast slope and range from 7-band means
+        let (spectral_contrast_slope, spectral_contrast_range) = {
+            if spectral_contrast.len() == 7 {
+                // Compute mean contrast per band
+                let band_means: Vec<f32> = spectral_contrast.iter().map(|band| {
+                    if band.is_empty() { 0.0 }
+                    else { band.iter().sum::<f32>() / band.len() as f32 }
+                }).collect();
+
+                // Linear regression: y = band_means, x = 0..6
+                let n = 7.0_f32;
+                let x_mean = 3.0; // (0+1+2+3+4+5+6)/7
+                let y_mean: f32 = band_means.iter().sum::<f32>() / n;
+                let mut cov = 0.0_f32;
+                let mut var_x = 0.0_f32;
+                for (i, &y) in band_means.iter().enumerate() {
+                    let dx = i as f32 - x_mean;
+                    cov += dx * (y - y_mean);
+                    var_x += dx * dx;
+                }
+                let slope = if var_x > 1e-10 { cov / var_x } else { 0.0 };
+
+                // Range
+                let min = band_means.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = band_means.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let range = max - min;
+
+                (slope, range)
+            } else {
+                (0.0, 0.0)
+            }
+        };
+
+        // Onset strength contour: DCT-II of spectral flux, first 4 coefficients
+        // Captures the temporal shape of rhythmic intensity
+        let onset_strength_contour = {
+            let n = spectral_flux.len();
+            if n >= 8 {
+                let n_f = n as f64;
+                // Normalize flux to zero-mean for cleaner DCT
+                let mean: f64 = spectral_flux.iter().map(|&v| v as f64).sum::<f64>() / n_f;
+                let centered: Vec<f64> = spectral_flux.iter().map(|&v| v as f64 - mean).collect();
+
+                // DCT-II: C[k] = sum_n x[n] * cos(pi * k * (2n+1) / (2N))
+                let mut coeffs = Vec::with_capacity(4);
+                for k in 0..4u32 {
+                    let coeff: f64 = centered.iter().enumerate().map(|(ni, &x)| {
+                        x * (std::f64::consts::PI * k as f64 * (2.0 * ni as f64 + 1.0) / (2.0 * n_f)).cos()
+                    }).sum();
+                    // Normalize by sqrt(2/N) for orthonormal DCT
+                    let norm = if k == 0 {
+                        (1.0 / n_f).sqrt()
+                    } else {
+                        (2.0 / n_f).sqrt()
+                    };
+                    coeffs.push((coeff * norm) as f32);
+                }
+                coeffs
+            } else {
+                vec![0.0; 4]
+            }
+        };
+
         // Generate visualizations (skip if configured)
         let (waveform_base64, spectrogram_base64, power_curve_base64) =
             if self.config.skip_visualization {
@@ -1661,6 +1817,11 @@ impl AnalysisEngine {
                 microtiming_bias: mt_bias,
                 temporal_modulation_bands,
                 chroma_self_similarity_bandwidth,
+                harmonic_percussive_ratio,
+                chromagram_entropy,
+                spectral_contrast_slope,
+                spectral_contrast_range,
+                onset_strength_contour,
             },
             temporal: TemporalAnalysis {
                 tempo,
