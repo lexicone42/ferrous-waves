@@ -780,9 +780,17 @@ impl SegmentAnalyzer {
                 intervals.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let median_period = intervals[intervals.len() / 2];
 
+                // Compute strength as fraction of intervals within ±10% of median
+                let tolerance = median_period * 0.1;
+                let consistent_count = intervals
+                    .iter()
+                    .filter(|&&iv| (iv - median_period).abs() <= tolerance)
+                    .count();
+                let strength = consistent_count as f32 / intervals.len() as f32;
+
                 events.push(PeriodicEvent {
                     period: median_period,
-                    strength: 0.7,
+                    strength,
                     event_type: "Energy Peak".to_string(),
                     phase: energy_peaks[0] % median_period,
                 });
@@ -945,22 +953,42 @@ impl SegmentAnalyzer {
         segments: &[AudioSegment],
         patterns: &TemporalPatterns,
     ) -> f32 {
-        // Factor 1: Variety in segment labels
-        let unique_labels: std::collections::HashSet<_> =
-            segments.iter().map(|s| &s.label).collect();
-        let label_variety = unique_labels.len() as f32 / segments.len().max(1) as f32;
+        if segments.is_empty() {
+            return 0.0;
+        }
 
-        // Factor 2: Energy variance
-        let energy_variance = patterns.energy_profile.variance;
+        let energies: Vec<f32> = segments.iter().map(|s| s.energy).collect();
+        let mean_energy = energies.iter().sum::<f32>() / energies.len() as f32;
 
-        // Factor 3: Number of transitions
-        let transition_rate = patterns.tension_profile.len() as f32 / segments.len().max(1) as f32;
+        // Factor 1 (0.2): Energy range — how wide the dynamic spread is
+        let min_e = energies.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_e = energies.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let energy_range = if max_e > 1e-10 {
+            ((max_e - min_e) / max_e).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
 
-        // Factor 4: Lack of repetition
-        let repetition_factor = 1.0 - (patterns.repetitions.len() as f32 / 10.0).min(1.0);
+        // Factor 2 (0.2): Energy CV — coefficient of variation
+        let energy_cv = if mean_energy > 1e-10 {
+            let var = energies.iter().map(|&e| (e - mean_energy).powi(2)).sum::<f32>()
+                / energies.len() as f32;
+            (var.sqrt() / mean_energy).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
 
-        let complexity =
-            (label_variety + energy_variance + transition_rate + repetition_factor) / 4.0;
+        // Factor 3 (0.4): Transition rate per segment (transitions = tension profile entries)
+        let n_seg = segments.len() as f32;
+        let transition_rate = (patterns.tension_profile.len() as f32 / n_seg).clamp(0.0, 1.0);
+
+        // Factor 4 (0.2): Repetition density — more repetitions = less complex
+        let repetition_density = 1.0 - (patterns.repetitions.len() as f32 / n_seg).clamp(0.0, 1.0);
+
+        let complexity = energy_range * 0.2
+            + energy_cv * 0.2
+            + transition_rate * 0.4
+            + repetition_density * 0.2;
 
         complexity.clamp(0.0, 1.0)
     }

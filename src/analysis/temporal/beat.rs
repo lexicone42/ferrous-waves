@@ -113,8 +113,10 @@ impl BeatTracker {
                         .map(|(&a, &b)| a * b)
                         .sum::<f32>()
                         / energy;
-                    // Prefer half-tempo if its correlation is at least 80% of the peak
-                    if half_corr > best_corr * 0.8 {
+                    // Prefer half-tempo if its correlation is at least 60% of the peak.
+                    // Jam-band tracks at 160+ BPM often have half-period correlations
+                    // in the 0.6-0.75 range due to polyrhythmic complexity.
+                    if half_corr > best_corr * 0.6 {
                         return Some(bpm / 2.0);
                     }
                 }

@@ -903,38 +903,17 @@ impl AnalysisEngine {
             .map(|t| beat_tracker.track_beats(&onsets, t))
             .unwrap_or_default();
 
-        // Calculate tempo stability by measuring how well actual onsets align with
-        // the beat grid. Mean normalized onset-to-beat distance: 0 = perfect alignment,
-        // 0.5 = maximally misaligned. Map to 0-1 stability score.
-        let tempo_stability = if !beats.is_empty() && !onsets.is_empty() {
-            let beat_period = if beats.len() > 1 {
-                beats[1] - beats[0]
-            } else {
-                tempo.unwrap_or(120.0).recip() * 60.0
-            };
-
-            if beat_period > 0.0 {
-                let mut total_deviation = 0.0_f32;
-                let mut count = 0;
-
-                for &beat in &beats {
-                    // Find nearest onset to this beat
-                    let min_dist = onsets
-                        .iter()
-                        .map(|&o| (o - beat).abs())
-                        .fold(f32::MAX, f32::min);
-                    // Normalize by beat period (0 = on beat, 0.5 = maximally off)
-                    total_deviation += (min_dist / beat_period).min(0.5);
-                    count += 1;
-                }
-
-                if count > 0 {
-                    let mean_dev = total_deviation / count as f32;
-                    // Map: mean_dev=0 → stability=1.0, mean_dev=0.25 → stability=0.0
-                    (1.0 - mean_dev / 0.25).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                }
+        // Tempo stability via inter-onset-interval coefficient of variation.
+        // CV = std(IOI) / mean(IOI). Low CV → steady tempo, high CV → rubato/free.
+        // Map CV to 0-1 stability: CV=0 → 1.0 (perfect), CV≥0.5 → 0.0 (free time).
+        let tempo_stability = if onsets.len() >= 4 {
+            let ioi: Vec<f32> = onsets.windows(2).map(|w| w[1] - w[0]).collect();
+            let mean_ioi = ioi.iter().sum::<f32>() / ioi.len() as f32;
+            if mean_ioi > 1e-6 {
+                let var = ioi.iter().map(|&x| (x - mean_ioi).powi(2)).sum::<f32>()
+                    / ioi.len() as f32;
+                let cv = var.sqrt() / mean_ioi;
+                (1.0 - cv / 0.5).clamp(0.0, 1.0)
             } else {
                 0.0
             }
@@ -1247,7 +1226,10 @@ impl AnalysisEngine {
             }
         };
 
-        // Chroma self-similarity bandwidth
+        // Chroma self-similarity bandwidth via similarity half-life.
+        // For each lag k, compute mean cosine similarity across all frame pairs
+        // separated by k steps. Find the first lag where mean similarity < 0.5,
+        // then normalize by total length. Robust to momentary outliers.
         let chroma_self_similarity_bandwidth = {
             if chroma.len() == 12 && !chroma[0].is_empty() {
                 let nf = chroma[0].len();
@@ -1257,40 +1239,41 @@ impl AnalysisEngine {
                 let ns = sampled.len();
 
                 if ns >= 4 {
-                    // Compute chroma vectors for sampled frames
                     let chroma_vecs: Vec<Vec<f32>> = sampled.iter().map(|&fi| {
                         (0..12).map(|c| chroma[c][fi]).collect()
                     }).collect();
 
-                    // For each frame on the diagonal, measure how far we can go
-                    // before similarity drops below threshold
-                    let threshold = 0.7; // cosine similarity threshold
-                    let mut bandwidths = Vec::new();
+                    // Pre-compute norms
+                    let norms: Vec<f32> = chroma_vecs.iter().map(|v| {
+                        v.iter().map(|&x| x * x).sum::<f32>().sqrt()
+                    }).collect();
 
-                    for i in 0..ns {
-                        let mut width = 0;
-                        for j in (i + 1)..ns {
-                            // Cosine similarity
-                            let dot: f32 = chroma_vecs[i].iter().zip(&chroma_vecs[j]).map(|(&a, &b)| a * b).sum();
-                            let norm_i: f32 = chroma_vecs[i].iter().map(|&v| v * v).sum::<f32>().sqrt();
-                            let norm_j: f32 = chroma_vecs[j].iter().map(|&v| v * v).sum::<f32>().sqrt();
-                            let sim = if norm_i > 1e-10 && norm_j > 1e-10 { dot / (norm_i * norm_j) } else { 0.0 };
-                            if sim >= threshold {
-                                width = j - i;
-                            } else {
+                    // For each lag, compute mean cosine similarity
+                    let max_lag = (ns / 2).max(1);
+                    let mut half_life_lag = max_lag; // default: never drops below 0.5
+                    for lag in 1..=max_lag {
+                        let mut sim_sum = 0.0_f32;
+                        let mut count = 0;
+                        for i in 0..(ns - lag) {
+                            let j = i + lag;
+                            let dot: f32 = chroma_vecs[i].iter().zip(&chroma_vecs[j])
+                                .map(|(&a, &b)| a * b).sum();
+                            let denom = norms[i] * norms[j];
+                            if denom > 1e-10 {
+                                sim_sum += dot / denom;
+                                count += 1;
+                            }
+                        }
+                        if count > 0 {
+                            let mean_sim = sim_sum / count as f32;
+                            if mean_sim < 0.5 {
+                                half_life_lag = lag;
                                 break;
                             }
                         }
-                        bandwidths.push(width as f32);
                     }
-
-                    let mean_bw = if !bandwidths.is_empty() {
-                        bandwidths.iter().sum::<f32>() / bandwidths.len() as f32
-                    } else {
-                        0.0
-                    };
-                    // Normalize by total sampled frames
-                    mean_bw / ns as f32
+                    // Normalize: long half-life → high bandwidth (harmonically stable)
+                    half_life_lag as f32 / ns as f32
                 } else {
                     0.0
                 }
@@ -1525,6 +1508,7 @@ impl AnalysisEngine {
         let musical = musical_analyzer.analyze_with_spectrogram(
             &spectrogram,
             self.fft_size,
+            self.hop_size,
             mono.len(),
         )?;
 

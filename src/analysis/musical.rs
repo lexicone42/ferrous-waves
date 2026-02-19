@@ -1,6 +1,17 @@
 use crate::analysis::spectral::StftProcessor;
 use crate::utils::error::Result;
 
+// Krumhansl-Kessler key profiles (from cognitive probe-tone studies).
+// Each array gives the perceptual stability rating for each pitch class
+// relative to the tonic at index 0.
+const KK_MAJOR: [f32; 12] = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const KK_MINOR: [f32; 12] = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+// Modal profiles derived from scale degrees.
+// Mixolydian (major with b7) — Grateful Dead staple (Fire on the Mountain, Scarlet Begonias)
+const KK_MIXOLYDIAN: [f32; 12] = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 3.80, 2.29];
+// Dorian (minor with natural 6) — common in jam-band improvisation
+const KK_DORIAN: [f32; 12] = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 2.69, 3.98, 3.34, 2.69];
+
 /// Musical key with confidence score
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MusicalKey {
@@ -59,6 +70,14 @@ pub struct MusicalAnalysis {
 
     /// Time signature estimation
     pub time_signature: Option<TimeSignature>,
+
+    /// Fraction of frames classified as major key (0.0 = all minor, 1.0 = all major).
+    /// Uses per-frame K-K profile correlation at the detected root.
+    pub major_frame_ratio: f32,
+
+    /// Fraction of detected chords that are major (not ending in 'm').
+    /// Falls back to 0.5 when no chords detected.
+    pub major_chord_ratio: f32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -113,25 +132,29 @@ impl MusicalAnalyzer {
         );
         let spectrogram = stft_processor.process(samples);
 
-        self.analyze_inner(&spectrogram, self.fft_size, samples.len())
+        self.analyze_inner(&spectrogram, self.fft_size, self.hop_size, samples.len())
     }
 
     /// Analyze using a pre-computed spectrogram, avoiding a redundant STFT.
     /// `spectrogram_fft_size` is the FFT size used to produce the spectrogram
     /// (needed for correct frequency bin mapping in chroma extraction).
+    /// `spectrogram_hop_size` is the hop size used to produce the spectrogram
+    /// (needed for correct timing in chord detection).
     pub fn analyze_with_spectrogram(
         &self,
         spectrogram: &ndarray::Array2<f32>,
         spectrogram_fft_size: usize,
+        spectrogram_hop_size: usize,
         num_samples: usize,
     ) -> Result<MusicalAnalysis> {
-        self.analyze_inner(spectrogram, spectrogram_fft_size, num_samples)
+        self.analyze_inner(spectrogram, spectrogram_fft_size, spectrogram_hop_size, num_samples)
     }
 
     fn analyze_inner(
         &self,
         spectrogram: &ndarray::Array2<f32>,
         fft_size: usize,
+        hop_size: usize,
         num_samples: usize,
     ) -> Result<MusicalAnalysis> {
         // Compute per-frame chroma vectors (reused for both key detection and chords)
@@ -155,10 +178,14 @@ impl MusicalAnalyzer {
 
         // Detect chord progression using pre-computed per-frame chroma
         let chord_progression =
-            self.detect_chord_progression_fast(&per_frame_chroma, num_samples, &key);
+            self.detect_chord_progression_fast(&per_frame_chroma, num_samples, hop_size, &key);
 
         // Estimate time signature (basic implementation)
         let time_signature = Self::estimate_time_signature()?;
+
+        // Compute major/minor ratios from per-frame chroma and chords
+        let major_frame_ratio = self.compute_major_frame_ratio(&per_frame_chroma, &key);
+        let major_chord_ratio = Self::compute_major_chord_ratio(&chord_progression);
 
         Ok(MusicalAnalysis {
             key,
@@ -168,6 +195,8 @@ impl MusicalAnalyzer {
             mode_clarity,
             harmonic_complexity,
             time_signature,
+            major_frame_ratio,
+            major_chord_ratio,
         })
     }
 
@@ -242,26 +271,6 @@ impl MusicalAnalyzer {
     }
 
     fn detect_key(&self, chroma: &ChromaVector) -> Result<MusicalKey> {
-        // Krumhansl-Kessler key profiles for major and minor
-        let major_profile = [
-            6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
-        ];
-        let minor_profile = [
-            6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
-        ];
-
-        // Modal profiles derived from scale degrees.
-        // Mixolydian (major with b7) — Grateful Dead staple (Fire on the Mountain, Scarlet Begonias)
-        // Weight pattern: tonic strong, 3rd major, 5th strong, b7 strong (distinguishes from major)
-        let mixolydian_profile = [
-            6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 3.80, 2.29,
-        ];
-        // Dorian (minor with natural 6) — common in jam-band improvisation
-        // Weight pattern: tonic strong, b3 present, 5th strong, natural 6 distinguishes from minor
-        let dorian_profile = [
-            6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 2.69, 3.98, 3.34, 2.69,
-        ];
-
         let mut key_scores = Vec::new();
         let note_names = [
             "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
@@ -274,10 +283,10 @@ impl MusicalAnalyzer {
         // Test all 48 keys (12 roots × 4 modes)
         for (shift, note_name) in note_names.iter().enumerate() {
             let profiles: &[(&[f32; 12], KeyMode, &str)] = &[
-                (&major_profile, KeyMode::Major, "major"),
-                (&minor_profile, KeyMode::Minor, "minor"),
-                (&mixolydian_profile, KeyMode::Mixolydian, "mixolydian"),
-                (&dorian_profile, KeyMode::Dorian, "dorian"),
+                (&KK_MAJOR, KeyMode::Major, "major"),
+                (&KK_MINOR, KeyMode::Minor, "minor"),
+                (&KK_MIXOLYDIAN, KeyMode::Mixolydian, "mixolydian"),
+                (&KK_DORIAN, KeyMode::Dorian, "dorian"),
             ];
 
             for &(profile, ref mode, mode_name) in profiles {
@@ -300,8 +309,13 @@ impl MusicalAnalyzer {
         // Calculate confidence based on score distribution
         let confidence = self.calculate_key_confidence(&key_scores);
 
-        // Get alternatives (top 3 excluding the best)
-        let alternatives = key_scores[1..4.min(key_scores.len())].to_vec();
+        // Dynamic alternatives: all keys scoring within 80% of the best
+        let threshold = best_key.score * 0.8;
+        let alternatives: Vec<KeyCandidate> = key_scores[1..]
+            .iter()
+            .filter(|k| k.score >= threshold)
+            .cloned()
+            .collect();
 
         Ok(MusicalKey {
             key: best_key.key.clone(),
@@ -379,56 +393,40 @@ impl MusicalAnalyzer {
     }
 
     fn calculate_tonality(&self, chroma: &ChromaVector, key: &MusicalKey) -> f32 {
-        // Measure how well the chroma fits a tonal profile
-        // Higher values indicate stronger tonality
-
-        // Get the appropriate profile
-        let profile = match key.mode {
-            KeyMode::Major => [
-                6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
-            ],
-            KeyMode::Minor => [
-                6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
-            ],
-            KeyMode::Mixolydian => [
-                6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 3.80, 2.29,
-            ],
-            KeyMode::Dorian => [
-                6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 2.69, 3.98, 3.34, 2.69,
-            ],
-        };
-
-        // Find root note index
+        let profile = Self::kk_profile_for_mode(&key.mode);
         let root_idx = self.note_to_index(&key.root);
-
-        // Calculate Pearson correlation (already in -1..1 range)
-        let correlation = self.pearson_correlate(&chroma.values, &profile, root_idx);
-
-        // Map to 0-1 range
+        let correlation = self.pearson_correlate(&chroma.values, profile, root_idx);
         ((correlation + 1.0) / 2.0).clamp(0.0, 1.0)
     }
 
+    fn kk_profile_for_mode(mode: &KeyMode) -> &'static [f32; 12] {
+        match mode {
+            KeyMode::Major => &KK_MAJOR,
+            KeyMode::Minor => &KK_MINOR,
+            KeyMode::Mixolydian => &KK_MIXOLYDIAN,
+            KeyMode::Dorian => &KK_DORIAN,
+        }
+    }
+
     fn calculate_mode_clarity(&self, chroma: &ChromaVector, key: &MusicalKey) -> f32 {
-        // Calculate how clearly the mode (major/minor) is defined
-
+        // Correlate chroma against all 4 K-K profiles at the detected root.
+        // mode_clarity = gap between best and 2nd-best mode, scaled to 0-1.
         let root_idx = self.note_to_index(&key.root);
+        let profiles = [&KK_MAJOR, &KK_MINOR, &KK_MIXOLYDIAN, &KK_DORIAN];
 
-        // Check third degree (major vs minor third)
-        let major_third_idx = (root_idx + 4) % 12;
-        let minor_third_idx = (root_idx + 3) % 12;
+        let mut scores: Vec<f32> = profiles
+            .iter()
+            .map(|p| self.pearson_correlate(&chroma.values, p, root_idx))
+            .collect();
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
 
-        let major_third_weight = chroma.values[major_third_idx];
-        let minor_third_weight = chroma.values[minor_third_idx];
-
-        // Clear mode when one third dominates
-        let third_diff = (major_third_weight - minor_third_weight).abs();
-
-        // Also check fifth (should be strong in both)
-        let fifth_idx = (root_idx + 7) % 12;
-        let fifth_weight = chroma.values[fifth_idx];
-
-        // Combine factors
-        (third_diff * 2.0 + fifth_weight).min(1.0)
+        if scores.len() >= 2 {
+            let gap = scores[0] - scores[1];
+            // Gap of 0.2+ = very clear mode; scale to 0-1
+            (gap / 0.2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
     }
 
     /// Measure harmonic complexity via chroma flux at musically meaningful intervals.
@@ -518,10 +516,12 @@ impl MusicalAnalyzer {
 
     /// Fast chord detection using pre-computed per-frame chroma vectors.
     /// Eliminates ~3800 STFT recomputations on a 16-min track.
+    /// `hop_size` must match the hop used to produce the spectrogram frames.
     fn detect_chord_progression_fast(
         &self,
         per_frame_chroma: &[[f32; 12]],
         total_samples: usize,
+        hop_size: usize,
         key: &MusicalKey,
     ) -> Option<ChordProgression> {
         if per_frame_chroma.is_empty() {
@@ -533,7 +533,7 @@ impl MusicalAnalyzer {
 
         // How many STFT frames correspond to one 0.5s segment?
         let frames_per_segment =
-            ((segment_duration * self.sample_rate) / self.hop_size as f32).ceil() as usize;
+            ((segment_duration * self.sample_rate) / hop_size as f32).ceil() as usize;
         let frames_per_hop = frames_per_segment / 2; // 50% overlap
 
         if frames_per_segment == 0 || per_frame_chroma.len() < frames_per_segment {
@@ -548,7 +548,7 @@ impl MusicalAnalyzer {
             let window = &per_frame_chroma[frame_start..frame_start + frames_per_segment];
             let chroma = Self::aggregate_chroma(window);
 
-            let start_time = frame_start as f32 * self.hop_size as f32 / self.sample_rate;
+            let start_time = frame_start as f32 * hop_size as f32 / self.sample_rate;
 
             if let Some(chord) = self.detect_chord(&chroma, key) {
                 chords.push(ChordEvent {
@@ -683,6 +683,50 @@ impl MusicalAnalyzer {
             denominator: 4,
             confidence: 0.5,
         }))
+    }
+
+    /// Per-frame major/minor classification via K-K profile correlation.
+    /// Skip near-silent frames. Returns fraction classified as major (0.0-1.0).
+    fn compute_major_frame_ratio(&self, per_frame_chroma: &[[f32; 12]], key: &MusicalKey) -> f32 {
+        let root_idx = self.note_to_index(&key.root);
+        let mut major_count = 0_u32;
+        let mut total_count = 0_u32;
+
+        for frame in per_frame_chroma {
+            // Skip near-silent frames
+            let energy: f32 = frame.iter().sum();
+            if energy < 0.01 {
+                continue;
+            }
+
+            let major_corr = self.pearson_correlate(frame, &KK_MAJOR, root_idx);
+            let minor_corr = self.pearson_correlate(frame, &KK_MINOR, root_idx);
+
+            total_count += 1;
+            if major_corr >= minor_corr {
+                major_count += 1;
+            }
+        }
+
+        if total_count > 0 {
+            major_count as f32 / total_count as f32
+        } else {
+            0.5
+        }
+    }
+
+    /// Fraction of detected chords that are major (chord name not ending in 'm').
+    /// Falls back to 0.5 when no chords detected.
+    fn compute_major_chord_ratio(chord_progression: &Option<ChordProgression>) -> f32 {
+        match chord_progression {
+            Some(cp) if !cp.chords.is_empty() => {
+                let major_count = cp.chords.iter()
+                    .filter(|c| !c.chord.ends_with('m'))
+                    .count();
+                major_count as f32 / cp.chords.len() as f32
+            }
+            _ => 0.5,
+        }
     }
 
     fn note_to_index(&self, note: &str) -> usize {
