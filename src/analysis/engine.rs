@@ -96,6 +96,62 @@ pub struct SpectralAnalysis {
     pub pulse_clarity: f32,
     /// Offbeat energy ratio in mid band (high = reggae skank)
     pub offbeat_ratio: f32,
+
+    // === New features (v13) ===
+
+    // Timbral texture descriptors
+    /// Spectral crest factor: max/mean of magnitude spectrum per frame
+    /// High = tonal/harmonic (synths, sustained notes), low = noisy/percussive
+    pub spectral_crest: Vec<f32>,
+    /// Sensory roughness/dissonance per frame (Sethares model)
+    /// High = beating partials (distortion, clusters), low = consonance
+    pub roughness: Vec<f32>,
+
+    // MFCC dynamics (how timbre changes over time)
+    /// First time-derivative of 13 MFCCs: 13 coefficients × num_frames
+    pub mfcc_delta: Vec<Vec<f32>>,
+    /// Second time-derivative of 13 MFCCs: 13 coefficients × num_frames
+    pub mfcc_delta_delta: Vec<Vec<f32>>,
+
+    // Stereo characteristics
+    /// Per-frame L/R cross-correlation: 1.0 = mono, 0.0 = uncorrelated, <0 = out of phase
+    /// Empty for mono sources.
+    pub stereo_width: Vec<f32>,
+
+    // Onset envelope characteristics
+    /// Mean rise time from onset to peak (seconds)
+    pub attack_time_mean: f32,
+    /// Std dev of rise times
+    pub attack_time_std: f32,
+    /// Mean decay time from peak (seconds)
+    pub decay_time_mean: f32,
+    /// Std dev of decay times
+    pub decay_time_std: f32,
+    /// Mean peak onset strength (from spectral flux)
+    pub onset_strength_mean: f32,
+    /// Std dev of onset strengths
+    pub onset_strength_std: f32,
+    /// Skewness of onset strengths (positive = rare big hits, negative = uniform)
+    pub onset_strength_skewness: f32,
+
+    // Rhythm micro-features
+    /// Swing ratio at 8th-note level: 1.0 = straight, ~1.67 = shuffle, ~2.0 = hard swing
+    pub swing_ratio: f32,
+    /// Mean deviation of onsets from quantized grid (seconds)
+    pub microtiming_deviation_mean: f32,
+    /// Std dev of microtiming deviations
+    pub microtiming_deviation_std: f32,
+    /// Ahead-of-beat bias: positive = rushing, negative = dragging
+    pub microtiming_bias: f32,
+
+    // Temporal modulation spectrum (FFT of energy envelope)
+    /// Energy in modulation bands: [0.5-1Hz, 1-2Hz, 2-4Hz, 4-8Hz, 8-16Hz]
+    pub temporal_modulation_bands: Vec<f32>,
+
+    // Self-similarity structure
+    /// Average diagonal bandwidth of chroma self-similarity matrix
+    /// Wide = repetitive harmony (pop), narrow = through-composed (jazz/jams)
+    pub chroma_self_similarity_bandwidth: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +331,41 @@ impl AnalysisEngine {
             }
         }
 
+        // Stereo width: per-frame L/R cross-correlation (before mono conversion)
+        let stereo_width = if audio.buffer.channels >= 2 {
+            let left = audio.buffer.get_channel(0).unwrap_or_default();
+            let right = audio.buffer.get_channel(1).unwrap_or_default();
+            let frame_size = self.fft_size;
+            let hop_size = self.hop_size;
+            let mut widths = Vec::new();
+            let mut pos = 0;
+            while pos + frame_size <= left.len().min(right.len()) {
+                let l_frame = &left[pos..pos + frame_size];
+                let r_frame = &right[pos..pos + frame_size];
+                // Pearson correlation coefficient
+                let n = frame_size as f32;
+                let l_mean: f32 = l_frame.iter().sum::<f32>() / n;
+                let r_mean: f32 = r_frame.iter().sum::<f32>() / n;
+                let mut cov = 0.0_f32;
+                let mut l_var = 0.0_f32;
+                let mut r_var = 0.0_f32;
+                for i in 0..frame_size {
+                    let ld = l_frame[i] - l_mean;
+                    let rd = r_frame[i] - r_mean;
+                    cov += ld * rd;
+                    l_var += ld * ld;
+                    r_var += rd * rd;
+                }
+                let denom = (l_var * r_var).sqrt();
+                let corr = if denom > 1e-10 { cov / denom } else { 1.0 };
+                widths.push(corr);
+                pos += hop_size;
+            }
+            widths
+        } else {
+            Vec::new() // mono source — no stereo width
+        };
+
         // Convert to mono for analysis
         let mono = audio.buffer.to_mono();
 
@@ -318,6 +409,8 @@ impl AnalysisEngine {
         let mut sub_band_flux_bass = Vec::with_capacity(num_frames);
         let mut sub_band_flux_mid = Vec::with_capacity(num_frames);
         let mut sub_band_flux_high = Vec::with_capacity(num_frames);
+        let mut spectral_crest = Vec::with_capacity(num_frames);
+        let mut roughness_values = Vec::with_capacity(num_frames);
 
         // Pre-compute bin boundaries for sub-band energy
         let sr = audio.buffer.sample_rate as f32;
@@ -548,6 +641,48 @@ impl AnalysisEngine {
                     spectral_contrast[band].push(0.0);
                 }
             }
+
+            // Spectral crest factor: max / mean of magnitude spectrum
+            if magnitude_sum > 0.0 {
+                let mean_mag = magnitude_sum / num_bins as f32;
+                spectral_crest.push(peak_mag / mean_mag);
+            } else {
+                spectral_crest.push(0.0);
+            }
+
+            // Sensory roughness (simplified Sethares model)
+            // Find spectral peaks, measure dissonance between nearby peak pairs
+            {
+                // Find local maxima in magnitude spectrum (peaks)
+                let mut peaks: Vec<(f32, f32)> = Vec::new(); // (frequency_hz, amplitude)
+                for bin in 1..num_bins.saturating_sub(1) {
+                    let mag = frame[bin];
+                    if mag > frame[bin - 1] && mag > frame[bin + 1] && mag > magnitude_sum / num_bins as f32 * 2.0 {
+                        let freq_hz = bin as f32 * sr / self.fft_size as f32;
+                        peaks.push((freq_hz, mag));
+                    }
+                }
+                // Sort by amplitude, keep top 20 peaks for efficiency
+                peaks.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                peaks.truncate(20);
+
+                // Sethares dissonance: d(f1,f2) = exp(-3.5*s*df) - exp(-5.75*s*df)
+                // where s = 0.24 / (0.021*fmin + 19), df = |f2-f1|
+                let mut total_roughness = 0.0_f32;
+                for i in 0..peaks.len() {
+                    for j in (i + 1)..peaks.len() {
+                        let (f1, a1) = peaks[i];
+                        let (f2, a2) = peaks[j];
+                        let fmin = f1.min(f2);
+                        let df = (f2 - f1).abs();
+                        if df < 1.0 || fmin < 20.0 { continue; }
+                        let s = 0.24 / (0.021 * fmin + 19.0);
+                        let d = (-3.5 * s * df).exp() - (-5.75 * s * df).exp();
+                        total_roughness += d * a1.min(a2); // weight by quieter partial
+                    }
+                }
+                roughness_values.push(total_roughness);
+            }
         }
 
         // Zero crossing rate (time-domain, windowed to match STFT frames)
@@ -613,6 +748,50 @@ impl AnalysisEngine {
                 }
             }
             coefficients
+        };
+
+        // MFCC deltas (Δ) and delta-deltas (ΔΔ): finite differences over time
+        let (mfcc_delta, mfcc_delta_delta) = {
+            let num_mfcc = mfcc.len(); // 13
+            let num_mfcc_frames = if num_mfcc > 0 { mfcc[0].len() } else { 0 };
+
+            // Delta: centered finite difference with window ±2
+            let mut deltas: Vec<Vec<f32>> = (0..num_mfcc)
+                .map(|_| Vec::with_capacity(num_mfcc_frames))
+                .collect();
+
+            let delta_n = 2i32; // window half-width
+            let denom = 2.0 * (1..=delta_n).map(|n| (n * n) as f32).sum::<f32>(); // 2*(1+4) = 10
+
+            for coeff in 0..num_mfcc {
+                for t in 0..num_mfcc_frames {
+                    let mut d = 0.0_f32;
+                    for n in 1..=delta_n {
+                        let t_plus = (t as i32 + n).min(num_mfcc_frames as i32 - 1) as usize;
+                        let t_minus = (t as i32 - n).max(0) as usize;
+                        d += n as f32 * (mfcc[coeff][t_plus] - mfcc[coeff][t_minus]);
+                    }
+                    deltas[coeff].push(d / denom);
+                }
+            }
+
+            // Delta-delta: same centered difference applied to deltas
+            let mut delta_deltas: Vec<Vec<f32>> = (0..num_mfcc)
+                .map(|_| Vec::with_capacity(num_mfcc_frames))
+                .collect();
+            for coeff in 0..num_mfcc {
+                for t in 0..num_mfcc_frames {
+                    let mut dd = 0.0_f32;
+                    for n in 1..=delta_n {
+                        let t_plus = (t as i32 + n).min(num_mfcc_frames as i32 - 1) as usize;
+                        let t_minus = (t as i32 - n).max(0) as usize;
+                        dd += n as f32 * (deltas[coeff][t_plus] - deltas[coeff][t_minus]);
+                    }
+                    delta_deltas[coeff].push(dd / denom);
+                }
+            }
+
+            (deltas, delta_deltas)
         };
 
         // Chromagram: map STFT magnitude to 12 pitch classes (C, C#, D, ..., B)
@@ -833,6 +1012,262 @@ impl AnalysisEngine {
                 (patterns, sync_val, pulse_c, offbeat_r)
             } else {
                 (vec![vec![0.0; 16]; 3], 0.0, 0.0, 1.0)
+            }
+        };
+
+        // === Post-spectral derived features ===
+
+        // Attack/decay envelope characteristics
+        let (attack_time_mean, attack_time_std, decay_time_mean, decay_time_std) = {
+            // For each onset, measure rise time to peak and decay time from peak
+            let onset_sr = sr / self.hop_size as f32; // frames per second
+            let mut attack_times = Vec::new();
+            let mut decay_times = Vec::new();
+
+            // Use RMS energy per frame as envelope
+            let energy_env: Vec<f32> = (0..num_frames).map(|fi| {
+                let frame = spectrogram.column(fi);
+                frame.iter().map(|&m| m * m).sum::<f32>().sqrt()
+            }).collect();
+
+            for (oi, &onset) in onsets.iter().enumerate() {
+                let onset_frame = ((onset * sr) as usize / self.hop_size).min(num_frames.saturating_sub(1));
+                let next_onset_frame = if oi + 1 < onsets.len() {
+                    ((onsets[oi + 1] * sr) as usize / self.hop_size).min(num_frames.saturating_sub(1))
+                } else {
+                    num_frames.saturating_sub(1)
+                };
+
+                // Find peak between this onset and next
+                let search_end = next_onset_frame.min(onset_frame + (0.5 * onset_sr) as usize); // max 500ms
+                if search_end <= onset_frame { continue; }
+
+                let mut peak_frame = onset_frame;
+                let mut peak_val = energy_env.get(onset_frame).copied().unwrap_or(0.0);
+                for f in onset_frame..=search_end.min(energy_env.len().saturating_sub(1)) {
+                    if energy_env[f] > peak_val {
+                        peak_val = energy_env[f];
+                        peak_frame = f;
+                    }
+                }
+
+                // Attack time: onset to peak
+                let attack_frames = peak_frame.saturating_sub(onset_frame);
+                if attack_frames > 0 {
+                    attack_times.push(attack_frames as f32 / onset_sr);
+                }
+
+                // Decay time: peak to -20dB (or 10% of peak energy)
+                let decay_threshold = peak_val * 0.1;
+                let mut decay_frame = peak_frame;
+                let decay_end = search_end.min(energy_env.len().saturating_sub(1));
+                for f in peak_frame..=decay_end {
+                    if energy_env[f] < decay_threshold {
+                        decay_frame = f;
+                        break;
+                    }
+                    decay_frame = f;
+                }
+                let decay_frames = decay_frame.saturating_sub(peak_frame);
+                if decay_frames > 0 {
+                    decay_times.push(decay_frames as f32 / onset_sr);
+                }
+            }
+
+            let (at_mean, at_std) = mean_std_f32(&attack_times);
+            let (dt_mean, dt_std) = mean_std_f32(&decay_times);
+            (at_mean, at_std, dt_mean, dt_std)
+        };
+
+        // Onset strength statistics (from spectral flux which IS the onset strength signal)
+        let (onset_str_mean, onset_str_std, onset_str_skew) = {
+            let (m, s) = mean_std_f32(&spectral_flux);
+            let skew = if s > 1e-10 && spectral_flux.len() > 2 {
+                let n = spectral_flux.len() as f32;
+                spectral_flux.iter()
+                    .map(|&v| ((v - m) / s).powi(3))
+                    .sum::<f32>() / n
+            } else {
+                0.0
+            };
+            (m, s, skew)
+        };
+
+        // Swing ratio and microtiming (from beat grid + onsets)
+        let (swing_ratio, mt_dev_mean, mt_dev_std, mt_bias) = {
+            if beats.len() >= 4 && onsets.len() >= 4 {
+                let beat_period = {
+                    let intervals: Vec<f32> = beats.windows(2).map(|w| w[1] - w[0]).collect();
+                    intervals.iter().sum::<f32>() / intervals.len() as f32
+                };
+                let eighth_note = beat_period / 2.0;
+
+                // For swing: measure consecutive 8th-note onset pair durations
+                // Quantize each onset to nearest 8th-note grid position
+                let bar_start = beats[0];
+                let mut eighth_positions: Vec<(f32, f32)> = Vec::new(); // (grid_pos, deviation)
+                for &onset in &onsets {
+                    if onset < bar_start { continue; }
+                    let pos_in_beats = (onset - bar_start) / eighth_note;
+                    let nearest_grid = pos_in_beats.round();
+                    let deviation = (pos_in_beats - nearest_grid) * eighth_note; // in seconds
+                    eighth_positions.push((nearest_grid, deviation));
+                }
+
+                // Swing ratio: for consecutive 8th-note pairs on even/odd grid positions
+                let mut long_short_ratios = Vec::new();
+                for pair in eighth_positions.windows(2) {
+                    let grid_diff = pair[1].0 - pair[0].0;
+                    if (grid_diff - 1.0).abs() < 0.1 {
+                        // Consecutive 8th notes
+                        let even_pos = pair[0].0 as i32;
+                        if even_pos % 2 == 0 {
+                            // Downbeat to upbeat
+                            let actual_duration = eighth_note + pair[1].1 - pair[0].1;
+                            let next_duration = eighth_note - pair[1].1 + pair[0].1;
+                            if next_duration > 0.01 {
+                                long_short_ratios.push(actual_duration / next_duration);
+                            }
+                        }
+                    }
+                }
+                let swing = if !long_short_ratios.is_empty() {
+                    long_short_ratios.iter().sum::<f32>() / long_short_ratios.len() as f32
+                } else {
+                    1.0
+                };
+
+                // Microtiming deviations
+                let deviations: Vec<f32> = eighth_positions.iter().map(|&(_, d)| d).collect();
+                let (dev_mean, dev_std) = mean_std_f32(&deviations);
+                // Bias: positive mean = rushing, negative = dragging
+                let bias = if !deviations.is_empty() {
+                    deviations.iter().sum::<f32>() / deviations.len() as f32
+                } else {
+                    0.0
+                };
+
+                (swing, dev_mean.abs(), dev_std, bias)
+            } else {
+                (1.0, 0.0, 0.0, 0.0)
+            }
+        };
+
+        // Temporal modulation spectrum: FFT of energy envelope
+        let temporal_modulation_bands = {
+            // Compute energy envelope at STFT frame rate
+            let envelope: Vec<f32> = (0..num_frames).map(|fi| {
+                let frame = spectrogram.column(fi);
+                frame.iter().map(|&m| m * m).sum::<f32>().sqrt()
+            }).collect();
+
+            let env_sr = sr / self.hop_size as f32; // ~86 Hz for sr=44100, hop=512
+            let env_len = envelope.len();
+
+            if env_len >= 64 {
+                // Zero-pad to next power of 2 for FFT
+                let fft_len = env_len.next_power_of_two();
+                let mut padded = vec![0.0_f32; fft_len];
+                // Remove DC and apply Hann window
+                let env_mean: f32 = envelope.iter().sum::<f32>() / env_len as f32;
+                for (i, &v) in envelope.iter().enumerate() {
+                    let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / env_len as f32).cos());
+                    padded[i] = (v - env_mean) * window;
+                }
+
+                // Real FFT using the same approach as autocorrelation:
+                // compute magnitude spectrum via DFT of first half
+                let half = fft_len / 2;
+                // DFT over specific bands (no full FFT needed)
+                // Use Goertzel-like approach for just the bins we need (5 bands)
+                // Band edges in Hz: [0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
+                let band_edges = [0.5_f32, 1.0, 2.0, 4.0, 8.0, 16.0];
+                let mut band_energies = vec![0.0_f32; 5];
+
+                // Convert band edges to bin indices
+                let bin_resolution = env_sr / fft_len as f32;
+                for b in 0..5 {
+                    let bin_lo = (band_edges[b] / bin_resolution).floor() as usize;
+                    let bin_hi = (band_edges[b + 1] / bin_resolution).ceil() as usize;
+                    let bin_lo = bin_lo.max(1).min(half);
+                    let bin_hi = bin_hi.max(bin_lo).min(half);
+
+                    // DFT for bins in this band
+                    let mut band_energy = 0.0_f32;
+                    for k in bin_lo..bin_hi {
+                        let mut re = 0.0_f32;
+                        let mut im = 0.0_f32;
+                        let freq = 2.0 * std::f32::consts::PI * k as f32 / fft_len as f32;
+                        for (n, &x) in padded.iter().enumerate().take(env_len) {
+                            re += x * (freq * n as f32).cos();
+                            im -= x * (freq * n as f32).sin();
+                        }
+                        band_energy += re * re + im * im;
+                    }
+                    let num_bins_in_band = (bin_hi - bin_lo).max(1) as f32;
+                    band_energies[b] = (band_energy / num_bins_in_band).sqrt();
+                }
+
+                // Normalize so bands sum to 1
+                let total: f32 = band_energies.iter().sum::<f32>().max(1e-10);
+                for e in &mut band_energies {
+                    *e /= total;
+                }
+                band_energies
+            } else {
+                vec![0.2; 5] // uniform if too short
+            }
+        };
+
+        // Chroma self-similarity bandwidth
+        let chroma_self_similarity_bandwidth = {
+            if chroma.len() == 12 && !chroma[0].is_empty() {
+                let nf = chroma[0].len();
+                // Sample frames (at most 200 for efficiency)
+                let step = (nf / 200).max(1);
+                let sampled: Vec<usize> = (0..nf).step_by(step).collect();
+                let ns = sampled.len();
+
+                if ns >= 4 {
+                    // Compute chroma vectors for sampled frames
+                    let chroma_vecs: Vec<Vec<f32>> = sampled.iter().map(|&fi| {
+                        (0..12).map(|c| chroma[c][fi]).collect()
+                    }).collect();
+
+                    // For each frame on the diagonal, measure how far we can go
+                    // before similarity drops below threshold
+                    let threshold = 0.7; // cosine similarity threshold
+                    let mut bandwidths = Vec::new();
+
+                    for i in 0..ns {
+                        let mut width = 0;
+                        for j in (i + 1)..ns {
+                            // Cosine similarity
+                            let dot: f32 = chroma_vecs[i].iter().zip(&chroma_vecs[j]).map(|(&a, &b)| a * b).sum();
+                            let norm_i: f32 = chroma_vecs[i].iter().map(|&v| v * v).sum::<f32>().sqrt();
+                            let norm_j: f32 = chroma_vecs[j].iter().map(|&v| v * v).sum::<f32>().sqrt();
+                            let sim = if norm_i > 1e-10 && norm_j > 1e-10 { dot / (norm_i * norm_j) } else { 0.0 };
+                            if sim >= threshold {
+                                width = j - i;
+                            } else {
+                                break;
+                            }
+                        }
+                        bandwidths.push(width as f32);
+                    }
+
+                    let mean_bw = if !bandwidths.is_empty() {
+                        bandwidths.iter().sum::<f32>() / bandwidths.len() as f32
+                    } else {
+                        0.0
+                    };
+                    // Normalize by total sampled frames
+                    mean_bw / ns as f32
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
             }
         };
 
@@ -1208,6 +1643,24 @@ impl AnalysisEngine {
                 syncopation,
                 pulse_clarity,
                 offbeat_ratio,
+                spectral_crest,
+                roughness: roughness_values,
+                mfcc_delta,
+                mfcc_delta_delta,
+                stereo_width,
+                attack_time_mean,
+                attack_time_std,
+                decay_time_mean,
+                decay_time_std,
+                onset_strength_mean: onset_str_mean,
+                onset_strength_std: onset_str_std,
+                onset_strength_skewness: onset_str_skew,
+                swing_ratio,
+                microtiming_deviation_mean: mt_dev_mean,
+                microtiming_deviation_std: mt_dev_std,
+                microtiming_bias: mt_bias,
+                temporal_modulation_bands,
+                chroma_self_similarity_bandwidth,
             },
             temporal: TemporalAnalysis {
                 tempo,
@@ -1350,4 +1803,18 @@ impl AnalysisEngine {
     pub fn config(&self) -> &AnalysisConfig {
         &self.config
     }
+}
+
+/// Compute mean and standard deviation of a float slice.
+fn mean_std_f32(values: &[f32]) -> (f32, f32) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = values.len() as f32;
+    let mean = values.iter().sum::<f32>() / n;
+    if values.len() < 2 {
+        return (mean, 0.0);
+    }
+    let var = values.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / (n - 1.0);
+    (mean, var.sqrt())
 }
