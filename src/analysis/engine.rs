@@ -903,33 +903,62 @@ impl AnalysisEngine {
             .map(|t| beat_tracker.track_beats(&onsets, t))
             .unwrap_or_default();
 
-        // Tempo stability via inter-beat-interval coefficient of variation.
-        // Uses DP-tracked beat positions (regularized but tempo-responsive).
-        // CV = std(IBI) / mean(IBI). Low CV → steady tempo, high CV → rubato/free.
-        // Map CV to 0-1 stability: CV=0 → 1.0 (perfect), CV≥0.3 → 0.0 (free time).
-        // Threshold 0.3 chosen for live jam bands: tight band ~0.05-0.10, free improv 0.30+.
-        let tempo_stability = if beats.len() >= 4 {
-            let ibi: Vec<f32> = beats.windows(2).map(|w| w[1] - w[0]).collect();
-            // Filter outlier intervals (beat-doubling/halving artifacts):
-            // keep only intervals within 50% of the median
-            let mut sorted_ibi = ibi.clone();
-            sorted_ibi.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let median = sorted_ibi[sorted_ibi.len() / 2];
-            let filtered: Vec<f32> = ibi.iter()
-                .copied()
-                .filter(|&x| x > median * 0.5 && x < median * 1.5)
-                .collect();
-            if filtered.len() >= 3 {
-                let mean = filtered.iter().sum::<f32>() / filtered.len() as f32;
-                let var = filtered.iter().map(|&x| (x - mean).powi(2)).sum::<f32>()
-                    / filtered.len() as f32;
-                let cv = var.sqrt() / mean;
-                (1.0 - cv / 0.3).clamp(0.0, 1.0)
+        // Tempo stability via windowed BPM coefficient of variation.
+        //
+        // Split spectral flux into overlapping 15s windows, estimate BPM per window
+        // via autocorrelation, octave-normalize to the full-track BPM (log2 folding),
+        // then compute CV. Low CV = consistent tempo; high CV = tempo drift or free time.
+        //
+        // This replaces IBI-based CV which was degenerate (track_beats emits constant
+        // intervals, so IBI CV measured floating-point noise, not tempo variation).
+        let tempo_stability = {
+            let frames_per_sec = audio.buffer.sample_rate as f32 / self.hop_size as f32;
+            let window_frames = (15.0 * frames_per_sec).round() as usize;
+            let hop_frames = window_frames / 2;
+
+            let windowed = beat_tracker.estimate_tempo_windowed(
+                &spectral_flux,
+                self.hop_size,
+                audio.buffer.sample_rate,
+                window_frames,
+                hop_frames,
+            );
+
+            if let (Some(anchor_bpm), true) = (tempo, windowed.len() >= 3) {
+                // Octave-normalize each window BPM to the full-track estimate.
+                // Short windows may lock onto half/double tempo; the full-track
+                // autocorrelation gives us the correct octave. We fold each window
+                // estimate to the nearest octave of the anchor via log2 rounding.
+                let normalized: Vec<f32> = windowed
+                    .iter()
+                    .filter_map(|&(bpm, _)| {
+                        if bpm <= 0.0 { return None; }
+                        let log_ratio = (bpm / anchor_bpm).log2();
+                        let octave_shift = log_ratio.round();
+                        Some(bpm / 2.0_f32.powf(octave_shift))
+                    })
+                    .collect();
+
+                if normalized.len() >= 3 {
+                    let mean = normalized.iter().sum::<f32>() / normalized.len() as f32;
+                    if mean > 0.0 {
+                        let var = normalized.iter()
+                            .map(|&x| (x - mean).powi(2))
+                            .sum::<f32>() / normalized.len() as f32;
+                        let cv = var.sqrt() / mean;
+                        // CV=0 → 1.0 (rock-steady), CV≥0.30 → 0.0 (rubato/free)
+                        // Threshold 0.30 accounts for windowed autocorrelation noise
+                        // in live jam-band recordings.
+                        (1.0_f32 - cv / 0.30).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                }
             } else {
                 0.0
             }
-        } else {
-            0.0
         };
 
         // Beat-synchronous rhythm features

@@ -221,6 +221,94 @@ impl BeatTracker {
 
         beats
     }
+
+    /// Estimate tempo in overlapping windows across the track.
+    ///
+    /// Returns `(bpm, peak_correlation)` pairs for each window. The correlation
+    /// strength measures beat clarity (high = strong beat, low = noise/free time).
+    /// Windows that fail to find any periodicity are omitted.
+    pub fn estimate_tempo_windowed(
+        &self,
+        onset_envelope: &[f32],
+        hop_size: usize,
+        sample_rate: u32,
+        window_frames: usize,
+        hop_frames: usize,
+    ) -> Vec<(f32, f32)> {
+        let mut results = Vec::new();
+        let mut start = 0;
+
+        let frame_duration = hop_size as f32 / sample_rate as f32;
+        let min_lag = (60.0 / (self.max_tempo * frame_duration)).floor() as usize;
+        let max_lag_limit = (60.0 / (self.min_tempo * frame_duration)).ceil() as usize;
+
+        while start + window_frames <= onset_envelope.len() {
+            let window = &onset_envelope[start..start + window_frames];
+
+            if window.len() >= 64 {
+                let max_lag = max_lag_limit.min(window.len() / 2);
+                if min_lag < max_lag && max_lag < window.len() {
+                    let mean = window.iter().sum::<f32>() / window.len() as f32;
+                    let centered: Vec<f32> = window.iter().map(|&x| x - mean).collect();
+                    let energy: f32 = centered.iter().map(|&x| x * x).sum();
+
+                    if energy > 1e-10 {
+                        let n = centered.len();
+                        let mut best_lag = min_lag;
+                        let mut best_corr = f32::NEG_INFINITY;
+
+                        for lag in min_lag..=max_lag {
+                            let corr: f32 = centered[..n - lag]
+                                .iter()
+                                .zip(centered[lag..].iter())
+                                .map(|(&a, &b)| a * b)
+                                .sum::<f32>()
+                                / energy;
+                            if corr > best_corr {
+                                best_corr = corr;
+                                best_lag = lag;
+                            }
+                        }
+
+                        // Minimal threshold: only reject windows with no periodicity at all
+                        if best_corr >= 0.005 {
+                            let tempo_lag = if best_lag > min_lag && best_lag < max_lag {
+                                let corr_at = |lag: usize| -> f32 {
+                                    centered[..n - lag]
+                                        .iter()
+                                        .zip(centered[lag..].iter())
+                                        .map(|(&a, &b)| a * b)
+                                        .sum::<f32>()
+                                        / energy
+                                };
+                                let prev = corr_at(best_lag - 1);
+                                let curr = best_corr;
+                                let next = corr_at(best_lag + 1);
+                                let denom = prev - 2.0 * curr + next;
+                                if denom.abs() > 1e-10 {
+                                    best_lag as f32 + 0.5 * (prev - next) / denom
+                                } else {
+                                    best_lag as f32
+                                }
+                            } else {
+                                best_lag as f32
+                            };
+
+                            let beat_period = tempo_lag * frame_duration;
+                            if beat_period > 0.0 {
+                                let bpm = 60.0 / beat_period;
+                                results.push((bpm, best_corr));
+                            }
+                        }
+                    }
+                }
+            }
+
+            start += hop_frames;
+        }
+
+        results
+    }
 }
 
 impl Default for BeatTracker {

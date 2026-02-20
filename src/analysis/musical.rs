@@ -157,14 +157,20 @@ impl MusicalAnalyzer {
         hop_size: usize,
         num_samples: usize,
     ) -> Result<MusicalAnalysis> {
-        // Compute per-frame chroma vectors (reused for both key detection and chords)
+        // Compute per-frame chroma vectors (reused for key detection, chords, and ratios)
         let per_frame_chroma = self.compute_per_frame_chroma_with_fft_size(spectrogram, fft_size);
 
         // Aggregate all frames into overall chromagram for key detection
         let chroma_vector = Self::aggregate_chroma(&per_frame_chroma);
 
-        // Detect key using Krumhansl-Kessler profiles
-        let key = self.detect_key(&chroma_vector)?;
+        // Bass-weighted chroma (60-350 Hz, 1/freq weighting) for root anchoring
+        let bass_chroma = self.compute_bass_chroma(spectrogram, fft_size);
+
+        // Chord root histogram (computed before key detection for root feedback)
+        let chord_root_hist = self.compute_chord_root_histogram(&per_frame_chroma, hop_size);
+
+        // Detect key using K-K profiles + bass/chord root evidence
+        let key = self.detect_key_with_root_evidence(&chroma_vector, &bass_chroma, &chord_root_hist)?;
 
         // Calculate tonality strength
         let tonality = self.calculate_tonality(&chroma_vector, &key);
@@ -250,6 +256,113 @@ impl MusicalAnalyzer {
         ChromaVector { values: chroma }
     }
 
+    /// Compute a bass-weighted chroma from 60-350 Hz, with 1/freq weighting.
+    ///
+    /// The bass guitar outlines the tonic in jam-band music. Standard chroma
+    /// (80-4000 Hz, unweighted) dilutes this signal with upper harmonics and
+    /// other instruments. This bass chroma emphasizes the fundamental frequencies
+    /// where the bass defines the key center.
+    ///
+    /// Returns a single normalized 12-bin distribution (aggregated over all frames).
+    fn compute_bass_chroma(
+        &self,
+        spectrogram: &ndarray::Array2<f32>,
+        fft_size: usize,
+    ) -> [f32; 12] {
+        let num_frames = spectrogram.shape()[1];
+        let a4_freq = 440.0;
+        let mut bass_chroma = [0.0_f32; 12];
+
+        for frame_idx in 0..num_frames {
+            let frame = spectrogram.column(frame_idx);
+
+            for (bin_idx, &magnitude) in frame.iter().enumerate() {
+                if magnitude > 0.001 {
+                    let freq = bin_idx as f32 * self.sample_rate / fft_size as f32;
+                    if freq >= 60.0 && freq <= 350.0 {
+                        let pitch_class = self.freq_to_pitch_class(freq, a4_freq);
+                        // Weight by 1/freq to emphasize lower bass fundamentals
+                        bass_chroma[pitch_class] += magnitude / freq;
+                    }
+                }
+            }
+        }
+
+        // Normalize to sum = 1.0
+        let sum: f32 = bass_chroma.iter().sum();
+        if sum > 0.0 {
+            for bin in &mut bass_chroma {
+                *bin /= sum;
+            }
+        }
+        bass_chroma
+    }
+
+    /// Build a confidence-weighted histogram of chord roots from per-frame chroma.
+    ///
+    /// Runs simplified chord detection (major/minor triad matching) on windowed
+    /// chroma segments, accumulates root pitch classes weighted by detection
+    /// confidence. The most frequent chord root is typically the tonic.
+    fn compute_chord_root_histogram(
+        &self,
+        per_frame_chroma: &[[f32; 12]],
+        hop_size: usize,
+    ) -> [f32; 12] {
+        let mut root_hist = [0.0_f32; 12];
+
+        // Use ~500ms windows, same as chord detection
+        let segment_duration = 0.5;
+        let frames_per_segment =
+            ((segment_duration * self.sample_rate) / hop_size as f32).ceil() as usize;
+        let frames_per_hop = frames_per_segment / 2;
+
+        if frames_per_segment == 0 || per_frame_chroma.len() < frames_per_segment {
+            return root_hist;
+        }
+
+        let major_template: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let minor_template: [f32; 12] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+
+        let mut frame_start = 0;
+        while frame_start + frames_per_segment <= per_frame_chroma.len() {
+            let window = &per_frame_chroma[frame_start..frame_start + frames_per_segment];
+            let agg = Self::aggregate_chroma(window);
+
+            // Find best chord root across all 24 triads
+            let mut best_score = 0.0_f32;
+            let mut best_root = 0_usize;
+
+            for shift in 0..12 {
+                let major_score = self.correlate_chord_template(&agg.values, &major_template, shift);
+                if major_score > best_score {
+                    best_score = major_score;
+                    best_root = shift;
+                }
+                let minor_score = self.correlate_chord_template(&agg.values, &minor_template, shift);
+                if minor_score > best_score {
+                    best_score = minor_score;
+                    best_root = shift;
+                }
+            }
+
+            // Weight by confidence (higher-confidence chords contribute more)
+            if best_score > 0.0 {
+                root_hist[best_root] += best_score;
+            }
+
+            frame_start += frames_per_hop;
+        }
+
+        // Normalize to sum = 1.0
+        let sum: f32 = root_hist.iter().sum();
+        if sum > 0.0 {
+            for bin in &mut root_hist {
+                *bin /= sum;
+            }
+        }
+        root_hist
+    }
+
     fn compute_chromagram(&self, samples: &[f32]) -> Result<ChromaVector> {
         // Process audio with STFT
         let stft_processor = StftProcessor::new(
@@ -270,15 +383,22 @@ impl MusicalAnalyzer {
         ((midi_note.round() as i32) % 12).rem_euclid(12) as usize
     }
 
-    fn detect_key(&self, chroma: &ChromaVector) -> Result<MusicalKey> {
+    /// Detect key using Pearson correlation with bass-chroma and chord-root re-ranking.
+    ///
+    /// After computing all 48 Pearson scores (12 roots × 4 modes), the top candidates
+    /// are boosted by how strongly their root appears in the bass chroma and chord root
+    /// histogram. This corrects the common "wrong root" problem where chroma shape
+    /// matches but the root is misidentified (e.g., A mixolydian → F major).
+    fn detect_key_with_root_evidence(
+        &self,
+        chroma: &ChromaVector,
+        bass_chroma: &[f32; 12],
+        chord_root_hist: &[f32; 12],
+    ) -> Result<MusicalKey> {
         let mut key_scores = Vec::new();
         let note_names = [
             "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
         ];
-
-        // Use Pearson correlation instead of dot product for better discrimination.
-        // Dot product favors whichever profile has higher total weight; Pearson
-        // measures shape similarity independent of magnitude.
 
         // Test all 48 keys (12 roots × 4 modes)
         for (shift, note_name) in note_names.iter().enumerate() {
@@ -300,13 +420,27 @@ impl MusicalAnalyzer {
             }
         }
 
-        // Sort by score
+        // Sort by raw Pearson score first
         key_scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
-        // Get top key
-        let best_key = &key_scores[0];
+        // Re-rank top 10 candidates with bass + chord root evidence.
+        // Modest boosts that break ties but don't override a strong Pearson match.
+        let bass_weight = 0.5;
+        let chord_weight = 0.4;
+        let rerank_count = 10.min(key_scores.len());
 
-        // Calculate confidence based on score distribution
+        for candidate in key_scores[..rerank_count].iter_mut() {
+            let root_idx = self.note_to_index(&candidate.root);
+            let root_boost = 1.0
+                + bass_weight * bass_chroma[root_idx]
+                + chord_weight * chord_root_hist[root_idx];
+            candidate.score *= root_boost;
+        }
+
+        // Re-sort after boosting
+        key_scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+        let best_key = &key_scores[0];
         let confidence = self.calculate_key_confidence(&key_scores);
 
         // Dynamic alternatives: all keys scoring within 80% of the best
@@ -359,17 +493,6 @@ impl MusicalAnalyzer {
         } else {
             0.0
         }
-    }
-
-    fn correlate_profiles(&self, chroma: &[f32; 12], profile: &[f32; 12], shift: usize) -> f32 {
-        let mut correlation = 0.0;
-
-        for (i, &profile_value) in profile.iter().enumerate() {
-            let chroma_idx = (i + shift) % 12;
-            correlation += chroma[chroma_idx] * profile_value;
-        }
-
-        correlation
     }
 
     fn calculate_key_confidence(&self, scores: &[KeyCandidate]) -> f32 {
@@ -499,19 +622,6 @@ impl MusicalAnalyzer {
         // Half-second chroma distances typically range 0.0 (sustained drone) to ~0.15
         // (rapid chord changes/modulations). Map to 0-1 with saturation at 0.12.
         (mean_distance / 0.12).clamp(0.0, 1.0)
-    }
-
-    /// Legacy: entropy of aggregate chroma. Kept for tests.
-    fn calculate_harmonic_complexity(&self, chroma: &ChromaVector) -> f32 {
-        let mut entropy = 0.0;
-
-        for &value in &chroma.values {
-            if value > 0.001 {
-                entropy -= value * value.log2();
-            }
-        }
-
-        (entropy / 3.58).clamp(0.0, 1.0)
     }
 
     /// Fast chord detection using pre-computed per-frame chroma vectors.
@@ -799,27 +909,34 @@ mod tests {
 
     #[test]
     fn test_harmonic_complexity() {
-        // Uniform chroma should have high complexity
-        let uniform_chroma = ChromaVector {
-            values: [1.0 / 12.0; 12],
-        };
-
         let analyzer = MusicalAnalyzer::new(44100.0);
-        let complexity = analyzer.calculate_harmonic_complexity(&uniform_chroma);
 
+        // Rapidly changing chroma (alternating between different pitch classes)
+        // should have high complexity. Need enough frames for the 43-frame window.
+        let mut changing_frames = Vec::new();
+        for i in 0..200 {
+            let mut frame = [0.0f32; 12];
+            // Alternate dominant pitch class every ~43 frames (one window)
+            let pc = (i / 43) % 12;
+            frame[pc] = 1.0;
+            changing_frames.push(frame);
+        }
+        let complexity = analyzer.calculate_harmonic_complexity_from_frames(&changing_frames);
         assert!(
-            complexity > 0.9,
-            "Uniform distribution should have high complexity"
+            complexity > 0.5,
+            "Rapidly changing chroma should have high complexity, got {}",
+            complexity
         );
 
-        // Single note should have low complexity
-        let mut single_note = [0.0; 12];
-        single_note[0] = 1.0;
-        let simple_chroma = ChromaVector {
-            values: single_note,
-        };
-
-        let simplicity = analyzer.calculate_harmonic_complexity(&simple_chroma);
-        assert!(simplicity < 0.1, "Single note should have low complexity");
+        // Static chroma (same frame repeated) should have zero complexity
+        let mut single_frame = [0.0f32; 12];
+        single_frame[0] = 1.0;
+        let static_frames = vec![single_frame; 200];
+        let simplicity = analyzer.calculate_harmonic_complexity_from_frames(&static_frames);
+        assert!(
+            simplicity < 0.01,
+            "Static chroma should have near-zero complexity, got {}",
+            simplicity
+        );
     }
 }
