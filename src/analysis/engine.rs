@@ -1,6 +1,6 @@
 use crate::analysis::classification::{ContentClassification, ContentClassifier};
 use crate::analysis::fingerprint::{AudioFingerprint, FingerprintGenerator};
-use crate::analysis::musical::{MusicalAnalysis, MusicalAnalyzer};
+use crate::analysis::musical::{MusicalAnalysis, MusicalAnalyzer, TimeSignature};
 use crate::analysis::perceptual::{calculate_perceptual_metrics, PerceptualMetrics};
 use crate::analysis::pitch::{PitchDetector, PitchTrack, PyinDetector, VibratoAnalysis};
 use crate::analysis::quality::{QualityAnalyzer, QualityAssessment};
@@ -1545,12 +1545,21 @@ impl AnalysisEngine {
 
         // Perform musical analysis (reuse engine's spectrogram to avoid a second STFT)
         let musical_analyzer = MusicalAnalyzer::new(audio.buffer.sample_rate as f32);
-        let musical = musical_analyzer.analyze_with_spectrogram(
+        let mut musical = musical_analyzer.analyze_with_spectrogram(
             &spectrogram,
             self.fft_size,
             self.hop_size,
             mono.len(),
         )?;
+
+        // Override stub time signature with onset-envelope autocorrelation estimate
+        if let Some(t) = tempo {
+            if let Some(ts) = estimate_time_signature_from_onsets(
+                &spectral_flux, t, self.hop_size, audio.buffer.sample_rate,
+            ) {
+                musical.time_signature = Some(ts);
+            }
+        }
 
         // Assess audio quality
         let quality_analyzer = QualityAnalyzer::new(audio.buffer.sample_rate as f32);
@@ -1988,6 +1997,97 @@ impl AnalysisEngine {
     pub fn config(&self) -> &AnalysisConfig {
         &self.config
     }
+}
+
+/// Estimate time signature from onset envelope autocorrelation at bar-level lags.
+///
+/// Given the beat period (from tempo), tests groupings of N beats (N = 2..7) by
+/// measuring autocorrelation at lag = N × beat_frames. The strongest bar-level
+/// grouping indicates beats-per-bar. Confidence is derived from the separation
+/// between the best and second-best candidates.
+fn estimate_time_signature_from_onsets(
+    onset_envelope: &[f32],
+    tempo_bpm: f32,
+    hop_size: usize,
+    sample_rate: u32,
+) -> Option<TimeSignature> {
+    if onset_envelope.len() < 64 || tempo_bpm <= 0.0 {
+        return None;
+    }
+
+    let frame_duration = hop_size as f32 / sample_rate as f32;
+    let beat_frames = 60.0 / tempo_bpm / frame_duration;
+
+    if beat_frames < 1.0 {
+        return None;
+    }
+
+    // Subtract mean, compute energy for normalization
+    let mean = onset_envelope.iter().sum::<f32>() / onset_envelope.len() as f32;
+    let centered: Vec<f32> = onset_envelope.iter().map(|&x| x - mean).collect();
+    let energy: f32 = centered.iter().map(|&x| x * x).sum();
+
+    if energy < 1e-10 {
+        return None;
+    }
+
+    let n = centered.len();
+
+    // Helper: compute normalized autocorrelation at a given lag
+    let autocorr_at = |lag: usize| -> f32 {
+        if lag >= n {
+            return 0.0;
+        }
+        centered[..n - lag]
+            .iter()
+            .zip(centered[lag..].iter())
+            .map(|(&a, &b)| a * b)
+            .sum::<f32>()
+            / energy
+    };
+
+    // Single-beat reference correlation
+    let beat_lag = beat_frames.round() as usize;
+    let beat_corr = autocorr_at(beat_lag).max(0.01);
+
+    // Test bar groupings: N beats per bar, N in 2..=7
+    let mut scores: Vec<(u8, f32)> = Vec::new();
+
+    for n_beats in 2..=7u8 {
+        let bar_lag = (n_beats as f32 * beat_frames).round() as usize;
+        if bar_lag >= n {
+            continue;
+        }
+        let bar_corr = autocorr_at(bar_lag);
+        // Score = bar correlation relative to single-beat correlation.
+        // This emphasizes the bar-level grouping beyond individual beats.
+        let score = bar_corr / beat_corr;
+        scores.push((n_beats, score));
+    }
+
+    if scores.is_empty() {
+        return None;
+    }
+
+    // Sort by score descending
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let best = scores[0];
+    let second = if scores.len() > 1 { scores[1].1 } else { 0.0 };
+
+    // Confidence from separation between best and second-best
+    let separation = if best.1 > 0.0 {
+        (best.1 - second) / best.1
+    } else {
+        0.0
+    };
+    let confidence = separation.clamp(0.0, 1.0);
+
+    Some(TimeSignature {
+        numerator: best.0,
+        denominator: 4,
+        confidence,
+    })
 }
 
 /// Compute mean and standard deviation of a float slice.

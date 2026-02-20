@@ -175,19 +175,19 @@ fn test_tempo_range_limits() {
     let fast_onsets: Vec<f32> = (0..20).map(|i| i as f32 * 0.25).collect();
     let fast_tempo = tracker.estimate_tempo(&fast_onsets);
 
-    // Tracker has max tempo of 200 BPM, so this might not be detected
-    // or might be detected as half-time (120 BPM)
+    // Tracker has max tempo of 300 BPM; 240 BPM is within range
+    // but octave ambiguity check may fold it to 120 BPM
     if let Some(tempo) = fast_tempo {
-        assert!(tempo <= 200.0, "Should respect max tempo limit");
+        assert!(tempo <= 300.0, "Should respect max tempo limit");
     }
 
-    // Very slow tempo (30 BPM = 2s apart)
-    let slow_onsets = vec![0.0, 2.0, 4.0, 6.0, 8.0];
+    // Very slow tempo (20 BPM = 3s apart) — below min of 30 BPM
+    let slow_onsets = vec![0.0, 3.0, 6.0, 9.0, 12.0];
     let slow_tempo = tracker.estimate_tempo(&slow_onsets);
 
-    // Tracker has min tempo of 60 BPM, so this might not be detected
-    // or might be detected as double-time (60 BPM)
+    // Tracker has min tempo of 30 BPM, so 20 BPM might not be detected
+    // or might be detected as double-time
     if let Some(tempo) = slow_tempo {
-        assert!(tempo >= 60.0, "Should respect min tempo limit");
+        assert!(tempo >= 30.0, "Should respect min tempo limit");
     }
 }

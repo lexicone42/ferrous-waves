@@ -6,15 +6,15 @@ pub struct BeatTracker {
 impl BeatTracker {
     pub fn new() -> Self {
         Self {
-            min_tempo: 50.0,
-            max_tempo: 220.0,
+            min_tempo: 30.0,
+            max_tempo: 300.0,
         }
     }
 
     /// Estimate tempo from an onset strength envelope using autocorrelation.
     ///
     /// The onset envelope (spectral flux) is autocorrelated at lags corresponding
-    /// to the valid tempo range (50-220 BPM). The lag with the highest
+    /// to the valid tempo range (30-300 BPM). The lag with the highest
     /// autocorrelation is the estimated beat period.
     ///
     /// This replaces the previous histogram-of-IOIs approach which produced

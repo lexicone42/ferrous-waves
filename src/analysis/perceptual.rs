@@ -26,6 +26,15 @@ pub struct PerceptualMetrics {
 
     /// Momentary loudness values (400ms windows)
     pub momentary_loudness: Vec<f32>,
+
+    /// Shannon entropy of LUFS histogram (0 = constant loudness, 1 = maximally varied)
+    pub dynamics_entropy: f32,
+
+    /// Linear regression slope of LUFS over time (LUFS/minute; positive = crescendo)
+    pub dynamics_slope: f32,
+
+    /// Number of local loudness maxima with ≥3 LU prominence
+    pub dynamics_peak_count: u32,
 }
 
 /// ITU-R BS.1770-4 K-weighting filter for LUFS measurement
@@ -134,6 +143,9 @@ pub fn calculate_perceptual_metrics(
             energy_level: 0.0,
             short_term_loudness: vec![],
             momentary_loudness: vec![],
+            dynamics_entropy: 0.0,
+            dynamics_slope: 0.0,
+            dynamics_peak_count: 0,
         });
     }
 
@@ -188,6 +200,10 @@ pub fn calculate_perceptual_metrics(
     // Map LUFS to energy: -60 LUFS = 0.0, -5 LUFS = 1.0
     let energy_level = ((integrated_lufs + 60.0) / 55.0).clamp(0.0, 1.0);
 
+    // Dynamics trajectory features (computed from short_term_loudness)
+    let (dynamics_entropy, dynamics_slope, dynamics_peak_count) =
+        compute_dynamics_trajectory(&short_term_loudness);
+
     Ok(PerceptualMetrics {
         loudness_lufs: integrated_lufs,
         loudness_range,
@@ -197,6 +213,9 @@ pub fn calculate_perceptual_metrics(
         energy_level,
         short_term_loudness,
         momentary_loudness,
+        dynamics_entropy,
+        dynamics_slope,
+        dynamics_peak_count,
     })
 }
 
@@ -332,6 +351,85 @@ fn calculate_momentary_loudness(weighted: &[f32], sample_rate: f32) -> Vec<f32> 
     }
 
     momentary_loudnesses
+}
+
+/// Compute dynamics trajectory features from short-term loudness values.
+///
+/// Returns (entropy, slope_per_minute, peak_count).
+fn compute_dynamics_trajectory(short_term_loudness: &[f32]) -> (f32, f32, u32) {
+    if short_term_loudness.len() < 2 {
+        return (0.0, 0.0, 0);
+    }
+
+    // --- Dynamics entropy: Shannon entropy of 1 dB LUFS histogram ---
+    let min_lufs = short_term_loudness.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max_lufs = short_term_loudness.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let range = max_lufs - min_lufs;
+
+    let entropy = if range > 0.5 {
+        let num_bins = (range.ceil() as usize).max(2); // 1 dB per bin
+        let mut hist = vec![0u32; num_bins];
+        for &v in short_term_loudness {
+            let bin = ((v - min_lufs) as usize).min(num_bins - 1);
+            hist[bin] += 1;
+        }
+        let n = short_term_loudness.len() as f32;
+        let mut h = 0.0_f32;
+        for &count in &hist {
+            if count > 0 {
+                let p = count as f32 / n;
+                h -= p * p.log2();
+            }
+        }
+        // Normalize by log2(num_bins) to get 0-1 range
+        let max_entropy = (num_bins as f32).log2();
+        if max_entropy > 0.0 { (h / max_entropy).clamp(0.0, 1.0) } else { 0.0 }
+    } else {
+        0.0 // Near-constant loudness
+    };
+
+    // --- Dynamics slope: least-squares LUFS/minute ---
+    // short_term_loudness has 100ms hop → each index = 0.1s
+    let n = short_term_loudness.len() as f64;
+    let hop_seconds = 0.1_f64;
+    let mut sum_x = 0.0_f64;
+    let mut sum_y = 0.0_f64;
+    let mut sum_xy = 0.0_f64;
+    let mut sum_xx = 0.0_f64;
+
+    for (i, &v) in short_term_loudness.iter().enumerate() {
+        let x = i as f64 * hop_seconds; // time in seconds
+        let y = v as f64;
+        sum_x += x;
+        sum_y += y;
+        sum_xy += x * y;
+        sum_xx += x * x;
+    }
+
+    let denom = n * sum_xx - sum_x * sum_x;
+    let slope_per_second = if denom.abs() > 1e-10 {
+        (n * sum_xy - sum_x * sum_y) / denom
+    } else {
+        0.0
+    };
+    let slope_per_minute = (slope_per_second * 60.0) as f32; // LUFS/minute
+
+    // --- Dynamics peak count: local maxima with ≥3 LU prominence ---
+    let mut peak_count = 0_u32;
+    for i in 1..short_term_loudness.len() - 1 {
+        let v = short_term_loudness[i];
+        if v > short_term_loudness[i - 1] && v > short_term_loudness[i + 1] {
+            // Find prominence: scan left and right for minimum
+            let left_min = short_term_loudness[..i].iter().cloned().fold(v, f32::min);
+            let right_min = short_term_loudness[i + 1..].iter().cloned().fold(v, f32::min);
+            let prominence = v - left_min.max(right_min); // use the higher of the two valleys
+            if prominence >= 3.0 {
+                peak_count += 1;
+            }
+        }
+    }
+
+    (entropy, slope_per_minute, peak_count)
 }
 
 #[cfg(test)]

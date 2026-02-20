@@ -78,6 +78,10 @@ pub struct MusicalAnalysis {
     /// Fraction of detected chords that are major (not ending in 'm').
     /// Falls back to 0.5 when no chords detected.
     pub major_chord_ratio: f32,
+
+    /// Number of key changes detected across 30s windows.
+    /// 0 = stays in one key the whole track. Higher = more modulations.
+    pub key_change_count: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -193,6 +197,9 @@ impl MusicalAnalyzer {
         let major_frame_ratio = self.compute_major_frame_ratio(&per_frame_chroma, &key);
         let major_chord_ratio = Self::compute_major_chord_ratio(&chord_progression);
 
+        // Count key changes across 30s windows
+        let key_change_count = self.count_key_changes(&per_frame_chroma, spectrogram, fft_size, hop_size);
+
         Ok(MusicalAnalysis {
             key,
             chord_progression,
@@ -203,6 +210,7 @@ impl MusicalAnalyzer {
             time_signature,
             major_frame_ratio,
             major_chord_ratio,
+            key_change_count,
         })
     }
 
@@ -320,28 +328,33 @@ impl MusicalAnalyzer {
             return root_hist;
         }
 
-        let major_template: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
-        let minor_template: [f32; 12] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        // Same templates as detect_chord (triads + 7ths) for consistent root detection
+        let templates: &[[f32; 12]] = &[
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], // major
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], // minor
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], // dim
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0], // dom7
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], // maj7
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0], // m7
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0], // m7b5
+        ];
 
         let mut frame_start = 0;
         while frame_start + frames_per_segment <= per_frame_chroma.len() {
             let window = &per_frame_chroma[frame_start..frame_start + frames_per_segment];
             let agg = Self::aggregate_chroma(window);
 
-            // Find best chord root across all 24 triads
+            // Find best chord root across all templates × 12 roots
             let mut best_score = 0.0_f32;
             let mut best_root = 0_usize;
 
             for shift in 0..12 {
-                let major_score = self.correlate_chord_template(&agg.values, &major_template, shift);
-                if major_score > best_score {
-                    best_score = major_score;
-                    best_root = shift;
-                }
-                let minor_score = self.correlate_chord_template(&agg.values, &minor_template, shift);
-                if minor_score > best_score {
-                    best_score = minor_score;
-                    best_root = shift;
+                for template in templates {
+                    let score = self.correlate_chord_template(&agg.values, template, shift);
+                    if score > best_score {
+                        best_score = score;
+                        best_root = shift;
+                    }
                 }
             }
 
@@ -732,38 +745,46 @@ impl MusicalAnalyzer {
     }
 
     fn detect_chord(&self, chroma: &ChromaVector, _key: &MusicalKey) -> Option<DetectedChord> {
-        // Simple triad detection
         let note_names = [
             "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
         ];
 
-        // Common chord templates (root, third, fifth)
-        let major_template = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
-        let minor_template = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        // Chord templates: (template, suffix, is_triad)
+        // Triads get a 1.1× bias because 7th chords have 4 active bins vs 3,
+        // giving them a natural advantage from noise. Triads should win when close.
+        let templates: &[([f32; 12], &str, bool)] = &[
+            // Triads
+            ([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], "",    true),  // major
+            ([1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], "m",   true),  // minor
+            ([1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], "dim", true),  // diminished
+            // 7th chords
+            ([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0], "7",    false), // dominant 7
+            ([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], "maj7", false), // major 7
+            ([1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0], "m7",   false), // minor 7
+            ([1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0], "m7b5", false), // half-dim
+        ];
 
         let mut best_chord = None;
-        let mut best_score = 0.0;
+        let mut best_score = 0.0_f32;
 
-        // Test common chords in the key
         for (shift, note_name) in note_names.iter().enumerate() {
-            // Major chord
-            let major_score = self.correlate_chord_template(&chroma.values, &major_template, shift);
-            if major_score > best_score {
-                best_score = major_score;
-                best_chord = Some(DetectedChord {
-                    name: note_name.to_string(),
-                    confidence: major_score,
-                });
-            }
-
-            // Minor chord
-            let minor_score = self.correlate_chord_template(&chroma.values, &minor_template, shift);
-            if minor_score > best_score {
-                best_score = minor_score;
-                best_chord = Some(DetectedChord {
-                    name: format!("{}m", note_name),
-                    confidence: minor_score,
-                });
+            for &(ref template, suffix, is_triad) in templates {
+                let mut score = self.correlate_chord_template(&chroma.values, template, shift);
+                if is_triad {
+                    score *= 1.1; // Prefer simpler interpretation when scores are close
+                }
+                if score > best_score {
+                    best_score = score;
+                    let name = if suffix.is_empty() {
+                        note_name.to_string()
+                    } else {
+                        format!("{}{}", note_name, suffix)
+                    };
+                    best_chord = Some(DetectedChord {
+                        name,
+                        confidence: score,
+                    });
+                }
             }
         }
 
@@ -825,18 +846,115 @@ impl MusicalAnalyzer {
         }
     }
 
-    /// Fraction of detected chords that are major (chord name not ending in 'm').
+    /// Fraction of detected chords that have a major third (major-flavored).
+    /// Major, dominant 7, and major 7 chords count as major-flavored.
+    /// Minor, diminished, minor 7, and half-diminished count as non-major.
     /// Falls back to 0.5 when no chords detected.
     fn compute_major_chord_ratio(chord_progression: &Option<ChordProgression>) -> f32 {
         match chord_progression {
             Some(cp) if !cp.chords.is_empty() => {
                 let major_count = cp.chords.iter()
-                    .filter(|c| !c.chord.ends_with('m'))
+                    .filter(|c| {
+                        // Strip note name to get suffix
+                        let name = &c.chord;
+                        // Non-major suffixes: "m", "dim", "m7", "m7b5"
+                        !(name.ends_with('m') || name.ends_with("dim")
+                          || name.ends_with("m7") || name.ends_with("m7b5"))
+                    })
                     .count();
                 major_count as f32 / cp.chords.len() as f32
             }
             _ => 0.5,
         }
+    }
+
+    /// Count key changes by detecting local key in overlapping 30s windows.
+    /// A key change is counted when adjacent windows have a different root or mode.
+    fn count_key_changes(
+        &self,
+        per_frame_chroma: &[[f32; 12]],
+        spectrogram: &ndarray::Array2<f32>,
+        fft_size: usize,
+        hop_size: usize,
+    ) -> u32 {
+        let frame_duration = hop_size as f32 / self.sample_rate;
+        let window_seconds = 30.0;
+        let hop_seconds = 15.0;
+        let window_frames = (window_seconds / frame_duration).ceil() as usize;
+        let hop_frames = (hop_seconds / frame_duration).ceil() as usize;
+
+        if per_frame_chroma.len() < window_frames || window_frames == 0 || hop_frames == 0 {
+            return 0;
+        }
+
+        // Detect key in each window
+        let mut window_keys: Vec<(String, String)> = Vec::new(); // (root, mode_name)
+        let mut start = 0;
+
+        while start + window_frames <= per_frame_chroma.len() {
+            let window = &per_frame_chroma[start..start + window_frames];
+            let chroma = Self::aggregate_chroma(window);
+
+            // Compute local bass chroma from spectrogram slice
+            let spec_end = (start + window_frames).min(spectrogram.shape()[1]);
+            let local_spec = spectrogram.slice(ndarray::s![.., start..spec_end]);
+            let local_bass = self.compute_bass_chroma_from_slice(&local_spec, fft_size);
+
+            // Compute local chord root histogram
+            let local_chord_hist = self.compute_chord_root_histogram(window, hop_size);
+
+            if let Ok(key) = self.detect_key_with_root_evidence(&chroma, &local_bass, &local_chord_hist) {
+                if key.confidence >= 0.3 {
+                    let mode_str = format!("{:?}", key.mode);
+                    window_keys.push((key.root, mode_str));
+                }
+            }
+
+            start += hop_frames;
+        }
+
+        // Count transitions (different root or mode)
+        let mut changes = 0_u32;
+        for pair in window_keys.windows(2) {
+            if pair[0] != pair[1] {
+                changes += 1;
+            }
+        }
+
+        changes
+    }
+
+    /// Bass chroma from an Array2 slice (view), same logic as compute_bass_chroma
+    /// but works on a column slice rather than the full spectrogram.
+    fn compute_bass_chroma_from_slice(
+        &self,
+        spectrogram: &ndarray::ArrayView2<f32>,
+        fft_size: usize,
+    ) -> [f32; 12] {
+        let num_frames = spectrogram.shape()[1];
+        let a4_freq = 440.0;
+        let mut bass_chroma = [0.0_f32; 12];
+
+        for frame_idx in 0..num_frames {
+            let frame = spectrogram.column(frame_idx);
+            for (bin_idx, &magnitude) in frame.iter().enumerate() {
+                if magnitude > 0.001 {
+                    let freq = bin_idx as f32 * self.sample_rate / fft_size as f32;
+                    if freq >= 60.0 && freq <= 350.0 {
+                        let pitch_class = self.freq_to_pitch_class(freq, a4_freq);
+                        bass_chroma[pitch_class] += magnitude / freq;
+                    }
+                }
+            }
+        }
+
+        let sum: f32 = bass_chroma.iter().sum();
+        if sum > 0.0 {
+            for bin in &mut bass_chroma {
+                *bin /= sum;
+            }
+        }
+        bass_chroma
     }
 
     fn note_to_index(&self, note: &str) -> usize {
