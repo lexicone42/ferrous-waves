@@ -84,7 +84,10 @@ impl AudioDecoder {
         let data = std::fs::read(path)
             .map_err(|e| FerrousError::AudioDecode(format!("MP3 read error: {}", e)))?;
 
-        let (header, samples_iter) = puremp3::read_mp3(&data[..])
+        // puremp3 doesn't handle ID3v2 tags — skip past them to reach MPEG frames
+        let audio_data = skip_id3v2(&data);
+
+        let (header, samples_iter) = puremp3::read_mp3(audio_data)
             .map_err(|e| FerrousError::AudioDecode(format!("MP3 decode error: {:?}", e)))?;
 
         let sample_rate = header.sample_rate.hz();
@@ -121,4 +124,22 @@ impl AudioDecoder {
     pub fn num_channels(&self) -> Option<usize> {
         Some(self.channels)
     }
+}
+
+/// Skip past ID3v2 tag header if present. puremp3 expects raw MPEG frames
+/// but many MP3 files (especially those with embedded artwork) have large
+/// ID3v2 tags that confuse the frame sync search.
+fn skip_id3v2(data: &[u8]) -> &[u8] {
+    if data.len() >= 10 && &data[0..3] == b"ID3" {
+        // ID3v2 tag size is a 4-byte syncsafe integer (7 bits per byte)
+        let size = ((data[6] as usize) << 21)
+            | ((data[7] as usize) << 14)
+            | ((data[8] as usize) << 7)
+            | (data[9] as usize);
+        let total = size + 10; // 10-byte header + tag body
+        if total <= data.len() {
+            return &data[total..];
+        }
+    }
+    data
 }
