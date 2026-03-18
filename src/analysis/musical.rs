@@ -1,4 +1,4 @@
-use crate::analysis::spectral::StftProcessor;
+use crate::analysis::spectral::{ChromaFilterBank, StftProcessor};
 use crate::utils::error::Result;
 
 // Krumhansl-Kessler key profiles (from cognitive probe-tone studies).
@@ -219,32 +219,19 @@ impl MusicalAnalyzer {
         self.compute_per_frame_chroma_with_fft_size(spectrogram, self.fft_size)
     }
 
-    /// Compute chroma vectors using a spectrogram produced with the given fft_size.
+    /// Compute chroma vectors using a CQT-style filterbank applied to the STFT spectrogram.
+    ///
+    /// Uses triangular filters at semitone-spaced frequencies across multiple octaves,
+    /// folded into 12 pitch classes. This gives each pitch class equal representation
+    /// regardless of octave, solving the bass-dominance bias that occurs when mapping
+    /// linear FFT bins directly to pitch classes.
     fn compute_per_frame_chroma_with_fft_size(
         &self,
         spectrogram: &ndarray::Array2<f32>,
         fft_size: usize,
     ) -> Vec<[f32; 12]> {
-        let num_frames = spectrogram.shape()[1];
-        let a4_freq = 440.0;
-        let mut result = Vec::with_capacity(num_frames);
-
-        for frame_idx in 0..num_frames {
-            let frame = spectrogram.column(frame_idx);
-            let mut chroma = [0.0f32; 12];
-
-            for (bin_idx, &magnitude) in frame.iter().enumerate() {
-                if magnitude > 0.001 {
-                    let freq = bin_idx as f32 * self.sample_rate / fft_size as f32;
-                    if freq > 80.0 && freq < 4000.0 {
-                        let pitch_class = self.freq_to_pitch_class(freq, a4_freq);
-                        chroma[pitch_class] += magnitude;
-                    }
-                }
-            }
-            result.push(chroma);
-        }
-        result
+        let bank = ChromaFilterBank::default_for(self.sample_rate, fft_size);
+        bank.chroma_frames(spectrogram)
     }
 
     /// Aggregate per-frame chroma into a single normalized ChromaVector.
