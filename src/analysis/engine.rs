@@ -229,6 +229,39 @@ pub struct SpectralAnalysis {
     /// Number of distinct harmonic sections (segmented from chroma novelty curve).
     /// A jam with 3 distinct harmonic sections scores higher than a one-chord vamp.
     pub harmonic_section_count: u32,
+
+    // === Novel features (v19b) ===
+
+    // Jam departure distance: how far the improvisation strays from "home"
+    /// Maximum timbral distance (cosine) from the track's opening 60s.
+    /// High = the jam goes "way out there." Low = stays close to the song's sound.
+    pub timbral_departure_max: f32,
+    /// Mean timbral distance from opening 60s.
+    /// Sustained high = the jam left home and didn't come back.
+    pub timbral_departure_mean: f32,
+
+    // Crowd energy proxy (for live SBD recordings)
+    /// Mean energy ratio in the 3-6 kHz "crowd band" vs total spectrum.
+    /// In SBD recordings, crowd noise bleeds in above 3 kHz. Higher values
+    /// correlate with audience excitement. Not useful for studio recordings.
+    pub crowd_energy_mean: f32,
+    /// Std dev of crowd energy ratio. High = audience reacts to specific moments.
+    pub crowd_energy_std: f32,
+
+    // Spectral novelty (frame-to-frame surprise)
+    /// Mean cosine distance between adjacent spectral frames.
+    /// High = rapidly changing texture (exploratory). Low = static texture (drone/vamp).
+    pub spectral_novelty_mean: f32,
+    /// Std dev of spectral novelty. High = alternating novel and familiar passages.
+    pub spectral_novelty_std: f32,
+
+    // Groove stability arc (rolling rhythmic regularity)
+    /// Mean of rolling flux CV over 30-second windows.
+    /// Low = consistently groovy. High = consistently loose/chaotic.
+    pub groove_stability_mean: f32,
+    /// Std dev of rolling flux CV. High = transitions between tight and loose playing.
+    /// This is the "lock-in detector" — sharp drops in rolling CV = the band finding the groove.
+    pub groove_stability_std: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1664,6 +1697,155 @@ impl AnalysisEngine {
             }
         };
 
+        // === v19b novel features ===
+
+        // Timbral departure distance: how far the jam strays from "home" (first 60s).
+        // Uses MFCC vectors as timbral fingerprint, cosine distance from opening.
+        let (timbral_departure_max, timbral_departure_mean) = {
+            let mfcc = &mfcc;
+            let n_frames = if mfcc.is_empty() { 0 } else { mfcc[0].len() };
+            let n_coeffs = mfcc.len().min(13);
+            let frames_per_sec = audio.buffer.sample_rate as f32 / self.hop_size as f32;
+            let home_frames = (60.0 * frames_per_sec).min(n_frames as f32 / 3.0) as usize;
+
+            if n_frames > home_frames + 10 && n_coeffs >= 5 && home_frames > 0 {
+                // Compute "home" vector: mean MFCC of first 60s
+                let mut home = vec![0.0_f32; n_coeffs];
+                for c in 0..n_coeffs {
+                    for t in 0..home_frames {
+                        if t < mfcc[c].len() {
+                            home[c] += mfcc[c][t];
+                        }
+                    }
+                    home[c] /= home_frames as f32;
+                }
+
+                // Compute distance from home for each subsequent frame
+                let mut max_dist = 0.0_f32;
+                let mut sum_dist = 0.0_f32;
+                let mut count = 0usize;
+
+                for t in home_frames..n_frames {
+                    let mut dot = 0.0_f32;
+                    let mut na = 0.0_f32;
+                    let mut nb = 0.0_f32;
+                    for c in 0..n_coeffs {
+                        if t < mfcc[c].len() {
+                            let a = home[c];
+                            let b = mfcc[c][t];
+                            dot += a * b;
+                            na += a * a;
+                            nb += b * b;
+                        }
+                    }
+                    let denom = na.sqrt() * nb.sqrt();
+                    let dist = if denom > 1e-10 { 1.0 - dot / denom } else { 0.0 };
+                    max_dist = max_dist.max(dist);
+                    sum_dist += dist;
+                    count += 1;
+                }
+
+                if count > 0 {
+                    (max_dist, sum_dist / count as f32)
+                } else {
+                    (0.0, 0.0)
+                }
+            } else {
+                (0.0, 0.0)
+            }
+        };
+
+        // Crowd energy proxy: ratio of 3-6 kHz energy to total spectrum.
+        // In SBD recordings, crowd noise bleeds in as broadband noise above 3 kHz.
+        let (crowd_energy_mean, crowd_energy_std) = {
+            let bin_hz = audio.buffer.sample_rate as f32 / self.fft_size as f32;
+            let crowd_lo = (3000.0 / bin_hz).round() as usize;
+            let crowd_hi = ((6000.0 / bin_hz).round() as usize).min(num_bins);
+
+            let mut ratios = Vec::with_capacity(num_frames);
+            for t in 0..num_frames {
+                let frame = spectrogram.column(t);
+                let total: f32 = frame.iter().map(|&x| x * x).sum();
+                if total > 1e-10 {
+                    let crowd: f32 = frame.iter().skip(crowd_lo).take(crowd_hi - crowd_lo)
+                        .map(|&x| x * x).sum();
+                    ratios.push(crowd / total);
+                }
+            }
+
+            if ratios.len() >= 2 {
+                let n = ratios.len() as f32;
+                let mean = ratios.iter().sum::<f32>() / n;
+                let std = (ratios.iter().map(|&r| (r - mean).powi(2)).sum::<f32>() / n).sqrt();
+                (mean, std)
+            } else {
+                (0.0, 0.0)
+            }
+        };
+
+        // Spectral novelty: mean cosine distance between adjacent spectral frames.
+        let (spectral_novelty_mean, spectral_novelty_std) = {
+            if num_frames >= 3 {
+                let mut novelties = Vec::with_capacity(num_frames - 1);
+                for t in 1..num_frames {
+                    let prev = spectrogram.column(t - 1);
+                    let curr = spectrogram.column(t);
+                    let mut dot = 0.0_f32;
+                    let mut na = 0.0_f32;
+                    let mut nb = 0.0_f32;
+                    for bin in 0..num_bins {
+                        dot += prev[bin] * curr[bin];
+                        na += prev[bin] * prev[bin];
+                        nb += curr[bin] * curr[bin];
+                    }
+                    let denom = na.sqrt() * nb.sqrt();
+                    let dist = if denom > 1e-10 { 1.0 - dot / denom } else { 0.0 };
+                    novelties.push(dist);
+                }
+
+                let n = novelties.len() as f32;
+                let mean = novelties.iter().sum::<f32>() / n;
+                let std = (novelties.iter().map(|&d| (d - mean).powi(2)).sum::<f32>() / n).sqrt();
+                (mean, std)
+            } else {
+                (0.0, 0.0)
+            }
+        };
+
+        // Groove stability arc: rolling flux CV over 30-second windows.
+        // Tracks how rhythmic regularity evolves over the track.
+        let (groove_stability_mean, groove_stability_std) = {
+            let frames_per_sec = audio.buffer.sample_rate as f32 / self.hop_size as f32;
+            let window_frames = (30.0 * frames_per_sec).round() as usize;
+            let hop_frames = window_frames / 2;
+
+            if spectral_flux.len() > window_frames {
+                let mut cvs = Vec::new();
+                let mut start = 0;
+                while start + window_frames <= spectral_flux.len() {
+                    let window = &spectral_flux[start..start + window_frames];
+                    let n = window.len() as f32;
+                    let mean = window.iter().sum::<f32>() / n;
+                    if mean > 0.5 {
+                        let std = (window.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n).sqrt();
+                        cvs.push(std / mean);
+                    }
+                    start += hop_frames;
+                }
+
+                if cvs.len() >= 2 {
+                    let n = cvs.len() as f32;
+                    let mean = cvs.iter().sum::<f32>() / n;
+                    let std = (cvs.iter().map(|&c| (c - mean).powi(2)).sum::<f32>() / n).sqrt();
+                    (mean, std)
+                } else {
+                    (0.0, 0.0)
+                }
+            } else {
+                (0.0, 0.0)
+            }
+        };
+
         // Generate visualizations (skip if configured)
         let (waveform_base64, spectrogram_base64, power_curve_base64) =
             if self.config.skip_visualization {
@@ -2081,6 +2263,14 @@ impl AnalysisEngine {
                 beat_loudness_band_ratio,
                 danceability,
                 harmonic_section_count,
+                timbral_departure_max,
+                timbral_departure_mean,
+                crowd_energy_mean,
+                crowd_energy_std,
+                spectral_novelty_mean,
+                spectral_novelty_std,
+                groove_stability_mean,
+                groove_stability_std,
             },
             temporal: TemporalAnalysis {
                 tempo,
