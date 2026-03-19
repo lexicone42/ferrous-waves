@@ -180,6 +180,55 @@ pub struct SpectralAnalysis {
     /// Captures the *shape* of rhythmic intensity over time:
     /// [0] = overall level, [1] = linear trend, [2] = U-shape/arch, [3] = oscillation.
     pub onset_strength_contour: Vec<f32>,
+
+    // === New features (v19) ===
+
+    // Feature derivative statistics (Essentia dmean/dvar pattern)
+    // These capture how features CHANGE over time, not just their average.
+    // Critical for jam-band analysis where the *trajectory* matters more than the mean.
+
+    /// Mean of first derivative of spectral centroid (brightness change rate).
+    /// Positive = getting brighter over time, negative = getting darker.
+    pub centroid_dmean: f32,
+    /// Variance of first derivative of spectral centroid.
+    /// High = erratic brightness shifts, low = smooth brightness evolution.
+    pub centroid_dvar: f32,
+
+    /// Mean of first derivative of spectral flux (acceleration of texture change).
+    /// Positive = energy delivery speeding up, negative = calming down.
+    pub flux_dmean: f32,
+    /// Variance of first derivative of spectral flux.
+    pub flux_dvar: f32,
+
+    /// Mean of first derivative of roughness (dissonance trajectory).
+    /// Positive = building tension, negative = releasing.
+    pub roughness_dmean: f32,
+    /// Variance of first derivative of roughness.
+    pub roughness_dvar: f32,
+
+    /// Mean of first derivative of sub-band bass energy.
+    /// Positive = bass building, negative = bass dropping out.
+    pub bass_energy_dmean: f32,
+
+    // Beats loudness per frequency band (Essentia-inspired)
+    /// Mean energy at beat positions (total spectrum). Measures how strong the beats are.
+    pub beat_loudness_mean: f32,
+    /// Std dev of beat-position energy. High = dynamic accents, low = steady.
+    pub beat_loudness_std: f32,
+    /// Beat-position energy ratio per sub-band [bass, mid, high].
+    /// Shows where the rhythmic energy lives. High bass ratio = kick-heavy.
+    pub beat_loudness_band_ratio: Vec<f32>,
+
+    // Danceability proxy
+    /// Danceability estimate (0-1) from Detrended Fluctuation Analysis (DFA)
+    /// of the onset envelope. Measures long-range correlation in rhythmic structure.
+    /// High = predictable rhythm (danceable), low = complex/free rhythm.
+    pub danceability: f32,
+
+    // Section-diversity derived from chroma self-similarity
+    /// Number of distinct harmonic sections (segmented from chroma novelty curve).
+    /// A jam with 3 distinct harmonic sections scores higher than a one-chord vamp.
+    pub harmonic_section_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1459,6 +1508,162 @@ impl AnalysisEngine {
             }
         };
 
+        // === v19 features: derivative statistics and beat loudness ===
+
+        // Feature derivative statistics (dmean/dvar pattern from Essentia).
+        // These capture how features CHANGE over time.
+        let compute_dmean_dvar = |series: &[f32]| -> (f32, f32) {
+            if series.len() < 3 {
+                return (0.0, 0.0);
+            }
+            let derivs: Vec<f32> = series.windows(2).map(|w| w[1] - w[0]).collect();
+            let n = derivs.len() as f32;
+            let mean = derivs.iter().sum::<f32>() / n;
+            let var = derivs.iter().map(|&d| (d - mean).powi(2)).sum::<f32>() / n;
+            (mean, var)
+        };
+
+        let (centroid_dmean, centroid_dvar) = compute_dmean_dvar(&spectral_centroids);
+        let (flux_dmean, flux_dvar) = compute_dmean_dvar(&spectral_flux);
+        let (roughness_dmean, roughness_dvar) = if roughness_values.len() >= 3 {
+            compute_dmean_dvar(&roughness_values)
+        } else {
+            (0.0, 0.0)
+        };
+        let (bass_energy_dmean, _) = compute_dmean_dvar(&sub_band_energy_bass);
+
+        // Beat loudness: energy at beat positions, per sub-band
+        let (beat_loudness_mean, beat_loudness_std, beat_loudness_band_ratio) = {
+            if beats.len() >= 4 {
+                let frames_per_sec = audio.buffer.sample_rate as f32 / self.hop_size as f32;
+                let mut total_energies = Vec::with_capacity(beats.len());
+                let mut bass_energies = Vec::with_capacity(beats.len());
+                let mut mid_energies = Vec::with_capacity(beats.len());
+                let mut high_energies = Vec::with_capacity(beats.len());
+
+                for &beat_time in &beats {
+                    let frame = (beat_time * frames_per_sec).round() as usize;
+                    if frame < sub_band_energy_bass.len() {
+                        let bass = sub_band_energy_bass[frame];
+                        let mid = sub_band_energy_mid[frame];
+                        let high = sub_band_energy_high[frame];
+                        let total = bass + mid + high;
+                        total_energies.push(total);
+                        bass_energies.push(bass);
+                        mid_energies.push(mid);
+                        high_energies.push(high);
+                    }
+                }
+
+                if total_energies.len() >= 2 {
+                    let n = total_energies.len() as f32;
+                    let mean = total_energies.iter().sum::<f32>() / n;
+                    let std = (total_energies.iter()
+                        .map(|&e| (e - mean).powi(2))
+                        .sum::<f32>() / n)
+                        .sqrt();
+
+                    let total_sum: f32 = total_energies.iter().sum();
+                    let ratio = if total_sum > 1e-10 {
+                        vec![
+                            bass_energies.iter().sum::<f32>() / total_sum,
+                            mid_energies.iter().sum::<f32>() / total_sum,
+                            high_energies.iter().sum::<f32>() / total_sum,
+                        ]
+                    } else {
+                        vec![0.33, 0.33, 0.33]
+                    };
+                    (mean, std, ratio)
+                } else {
+                    (0.0, 0.0, vec![0.33, 0.33, 0.33])
+                }
+            } else {
+                (0.0, 0.0, vec![0.33, 0.33, 0.33])
+            }
+        };
+
+        // Danceability via rhythm regularity (simplified DFA-inspired metric).
+        // Measures how predictable the rhythm is by computing autocorrelation
+        // of the onset envelope at beat-period lag. High = danceable, low = free.
+        let danceability = {
+            if let Some(bpm) = tempo {
+                let frames_per_sec = audio.buffer.sample_rate as f32 / self.hop_size as f32;
+                let beat_lag = (60.0 / bpm * frames_per_sec).round() as usize;
+                let n = spectral_flux.len();
+                if beat_lag > 0 && beat_lag < n / 2 {
+                    let mean: f32 = spectral_flux.iter().sum::<f32>() / n as f32;
+                    let energy: f32 = spectral_flux.iter().map(|&x| (x - mean).powi(2)).sum();
+                    if energy > 1e-10 {
+                        let corr: f32 = spectral_flux[..n - beat_lag]
+                            .iter()
+                            .zip(spectral_flux[beat_lag..].iter())
+                            .map(|(&a, &b)| (a - mean) * (b - mean))
+                            .sum::<f32>()
+                            / energy;
+                        corr.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        };
+
+        // Harmonic section count: count distinct harmonic regions from chroma novelty
+        let harmonic_section_count = {
+            if chroma.len() == 12 && !chroma[0].is_empty() {
+                let n_frames = chroma[0].len();
+                if n_frames >= 20 {
+                    // Compute chroma novelty: cosine distance between adjacent frames
+                    let mut novelty = Vec::with_capacity(n_frames - 1);
+                    for t in 1..n_frames {
+                        let mut dot = 0.0_f32;
+                        let mut na = 0.0_f32;
+                        let mut nb = 0.0_f32;
+                        for pc in 0..12 {
+                            let a = chroma[pc][t - 1];
+                            let b = chroma[pc][t];
+                            dot += a * b;
+                            na += a * a;
+                            nb += b * b;
+                        }
+                        let denom = na.sqrt() * nb.sqrt();
+                        let sim = if denom > 1e-10 { dot / denom } else { 1.0 };
+                        novelty.push(1.0 - sim); // distance, not similarity
+                    }
+
+                    // Count peaks in novelty curve above threshold (section boundaries)
+                    let mean_novelty: f32 = novelty.iter().sum::<f32>() / novelty.len() as f32;
+                    let threshold = mean_novelty * 2.0; // 2x mean = significant change
+                    let min_gap = (5.0 * audio.buffer.sample_rate as f32
+                        / self.hop_size as f32) as usize; // 5 second minimum between sections
+
+                    let mut count = 1u32; // start with 1 section
+                    let mut last_boundary = 0usize;
+                    for (i, &nov) in novelty.iter().enumerate() {
+                        if nov > threshold
+                            && i > 0
+                            && i < novelty.len() - 1
+                            && nov > novelty[i - 1]
+                            && nov > novelty[i + 1]
+                            && i - last_boundary >= min_gap
+                        {
+                            count += 1;
+                            last_boundary = i;
+                        }
+                    }
+                    count
+                } else {
+                    1
+                }
+            } else {
+                1
+            }
+        };
+
         // Generate visualizations (skip if configured)
         let (waveform_base64, spectrogram_base64, power_curve_base64) =
             if self.config.skip_visualization {
@@ -1864,6 +2069,18 @@ impl AnalysisEngine {
                 spectral_contrast_slope,
                 spectral_contrast_range,
                 onset_strength_contour,
+                centroid_dmean,
+                centroid_dvar,
+                flux_dmean,
+                flux_dvar,
+                roughness_dmean,
+                roughness_dvar,
+                bass_energy_dmean,
+                beat_loudness_mean,
+                beat_loudness_std,
+                beat_loudness_band_ratio,
+                danceability,
+                harmonic_section_count,
             },
             temporal: TemporalAnalysis {
                 tempo,
