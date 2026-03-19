@@ -103,22 +103,28 @@ impl BeatTracker {
         let beat_period = tempo_lag * frame_duration;
         if beat_period > 0.0 {
             let bpm = 60.0 / beat_period;
-            // Handle octave ambiguity: if BPM is very high, check half-tempo
-            if bpm > 160.0 {
-                let half_lag = (tempo_lag * 2.0).round() as usize;
-                if half_lag <= max_lag {
-                    let half_corr: f32 = centered[..n - half_lag]
-                        .iter()
-                        .zip(centered[half_lag..].iter())
-                        .map(|(&a, &b)| a * b)
-                        .sum::<f32>()
-                        / energy;
-                    // Prefer half-tempo if its correlation is at least 60% of the peak.
-                    // Jam-band tracks at 160+ BPM often have half-period correlations
-                    // in the 0.6-0.75 range due to polyrhythmic complexity.
-                    if half_corr > best_corr * 0.6 {
-                        return Some(bpm / 2.0);
-                    }
+            // Handle octave ambiguity at ALL tempos: check whether half-tempo
+            // (double the lag) has comparable autocorrelation. If so, the
+            // detected tempo may be tracking eighth-notes instead of quarter-notes.
+            //
+            // Previously only checked >160 BPM, which missed 2000+ tracks in the
+            // 160-300 range where half-tempo falls in the natural 80-150 sweet spot.
+            let half_lag = (tempo_lag * 2.0).round() as usize;
+            if half_lag <= max_lag && bpm > 60.0 {
+                let half_corr: f32 = centered[..n - half_lag]
+                    .iter()
+                    .zip(centered[half_lag..].iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum::<f32>()
+                    / energy;
+
+                // Prefer half-tempo when:
+                // 1. Half-tempo correlation is strong enough (>= 50% of peak), AND
+                // 2. Half-tempo falls in the 55-155 BPM "musical" range
+                //    (most popular music, especially jam-band, lives here)
+                let half_bpm = bpm / 2.0;
+                if half_corr > best_corr * 0.5 && half_bpm >= 55.0 && half_bpm <= 155.0 {
+                    return Some(half_bpm);
                 }
             }
             Some(bpm)
@@ -159,9 +165,9 @@ impl BeatTracker {
         let median = sorted[sorted.len() / 2];
         let bpm = 60.0 / median;
 
-        // Handle octave ambiguity
-        if bpm > 160.0 {
-            // Check if half-tempo intervals are also well-represented
+        // Handle octave ambiguity at all tempos
+        let half_bpm = bpm / 2.0;
+        if half_bpm >= 55.0 && half_bpm <= 155.0 {
             let half_min = median * 1.8;
             let half_max = median * 2.2;
             let half_count = intervals
@@ -170,7 +176,7 @@ impl BeatTracker {
                 .count();
             let base_count = valid.len();
             if half_count as f32 > base_count as f32 * 0.3 {
-                return Some(bpm / 2.0);
+                return Some(half_bpm);
             }
         }
 

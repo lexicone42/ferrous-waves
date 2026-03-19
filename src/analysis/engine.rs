@@ -1325,21 +1325,30 @@ impl AnalysisEngine {
         // === v14 features ===
 
         // Harmonic-Percussive Ratio via median filtering (Fitzgerald 2010)
-        // Horizontal median → harmonic, vertical median → percussive
+        // Horizontal median → harmonic, vertical median → percussive.
+        //
+        // Focused on the 200-4000 Hz midrange where harmonic/percussive content
+        // actually varies between songs. Including the full spectrum caused 88%
+        // of tracks to cluster at 0.7 because broadband live recordings always
+        // have similar bass (harmonic) + cymbal (percussive) energy ratios.
+        //
+        // Also uses a wider kernel (31 frames ≈ 0.7s) for better HPSS separation.
         let harmonic_percussive_ratio = {
-            let kernel = 17; // median filter length (odd, ~17 frames ≈ 0.4s at typical hop)
+            let kernel = 31;
             let half = kernel / 2;
             let mut harmonic_energy = 0.0_f64;
             let mut total_energy = 0.0_f64;
 
-            // For each frequency bin, apply horizontal median filter across time
-            // to extract the harmonic component (sustained tones = horizontal lines)
-            for bin in 0..num_bins {
+            // Focus on midrange bins (200-4000 Hz)
+            let bin_hz = audio.buffer.sample_rate as f32 / self.fft_size as f32;
+            let lo_bin = (200.0_f32 / bin_hz).round() as usize;
+            let hi_bin = ((4000.0_f32 / bin_hz).round() as usize).min(num_bins);
+
+            for bin in lo_bin..hi_bin {
                 for t in 0..num_frames {
                     let orig = spectrogram[(bin, t)] as f64;
                     total_energy += orig * orig;
 
-                    // Horizontal median (time-direction) for harmonic
                     let t_start = if t >= half { t - half } else { 0 };
                     let t_end = (t + half + 1).min(num_frames);
                     let mut h_window: Vec<f32> = (t_start..t_end)
@@ -1355,7 +1364,7 @@ impl AnalysisEngine {
             if total_energy > 1e-10 {
                 (harmonic_energy / total_energy).min(1.0) as f32
             } else {
-                0.5 // no energy = neutral
+                0.5
             }
         };
 
