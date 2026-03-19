@@ -1954,14 +1954,12 @@ impl AnalysisEngine {
             }
         }
 
-        // Perform musical analysis (reuse engine's spectrogram to avoid a second STFT)
+        // Perform musical analysis with its own high-resolution STFT.
+        // The engine's FFT=2048 has 21.5 Hz/bin — too coarse for semitone-level
+        // chroma resolution (need ≤5.4 Hz/bin, i.e., FFT≥8192). The MusicalAnalyzer
+        // computes its own 8192-point STFT internally for accurate chroma extraction.
         let musical_analyzer = MusicalAnalyzer::new(audio.buffer.sample_rate as f32);
-        let mut musical = musical_analyzer.analyze_with_spectrogram(
-            &spectrogram,
-            self.fft_size,
-            self.hop_size,
-            mono.len(),
-        )?;
+        let mut musical = musical_analyzer.analyze(&mono)?;
 
         // Override stub time signature with onset-envelope autocorrelation estimate
         if let Some(t) = tempo {

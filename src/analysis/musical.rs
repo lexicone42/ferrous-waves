@@ -122,7 +122,7 @@ impl MusicalAnalyzer {
     pub fn new(sample_rate: f32) -> Self {
         Self {
             sample_rate,
-            fft_size: 4096, // Larger FFT for better frequency resolution
+            fft_size: 8192, // High-resolution FFT for semitone-accurate chroma (5.4 Hz/bin)
             hop_size: 2048,
         }
     }
