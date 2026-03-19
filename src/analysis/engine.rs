@@ -1708,7 +1708,11 @@ impl AnalysisEngine {
             let frames_per_sec = audio.buffer.sample_rate as f32 / self.hop_size as f32;
             let home_frames = (60.0 * frames_per_sec).min(n_frames as f32 / 3.0) as usize;
 
-            if n_frames > home_frames + 10 && n_coeffs >= 5 && home_frames > 0 {
+            // Use 10-second rolling windows (not individual frames) to reduce noise.
+            // Single MFCC frames are too noisy for meaningful cosine distance.
+            let window_frames = (10.0 * frames_per_sec).round() as usize;
+
+            if n_frames > home_frames + window_frames && n_coeffs >= 5 && home_frames > 0 {
                 // Compute "home" vector: mean MFCC of first 60s
                 let mut home = vec![0.0_f32; n_coeffs];
                 for c in 0..n_coeffs {
@@ -1720,29 +1724,40 @@ impl AnalysisEngine {
                     home[c] /= home_frames as f32;
                 }
 
-                // Compute distance from home for each subsequent frame
+                // Compare 10-second window averages against home
                 let mut max_dist = 0.0_f32;
                 let mut sum_dist = 0.0_f32;
                 let mut count = 0usize;
+                let hop = window_frames / 2;
+                let mut start = home_frames;
 
-                for t in home_frames..n_frames {
+                while start + window_frames <= n_frames {
+                    // Compute window average MFCC
+                    let mut win_avg = vec![0.0_f32; n_coeffs];
+                    for c in 0..n_coeffs {
+                        for t in start..start + window_frames {
+                            if t < mfcc[c].len() {
+                                win_avg[c] += mfcc[c][t];
+                            }
+                        }
+                        win_avg[c] /= window_frames as f32;
+                    }
+
+                    // Cosine distance between home and this window
                     let mut dot = 0.0_f32;
                     let mut na = 0.0_f32;
                     let mut nb = 0.0_f32;
                     for c in 0..n_coeffs {
-                        if t < mfcc[c].len() {
-                            let a = home[c];
-                            let b = mfcc[c][t];
-                            dot += a * b;
-                            na += a * a;
-                            nb += b * b;
-                        }
+                        dot += home[c] * win_avg[c];
+                        na += home[c] * home[c];
+                        nb += win_avg[c] * win_avg[c];
                     }
                     let denom = na.sqrt() * nb.sqrt();
                     let dist = if denom > 1e-10 { 1.0 - dot / denom } else { 0.0 };
                     max_dist = max_dist.max(dist);
                     sum_dist += dist;
                     count += 1;
+                    start += hop;
                 }
 
                 if count > 0 {
@@ -1826,7 +1841,7 @@ impl AnalysisEngine {
                     let window = &spectral_flux[start..start + window_frames];
                     let n = window.len() as f32;
                     let mean = window.iter().sum::<f32>() / n;
-                    if mean > 0.5 {
+                    if mean > 0.01 {
                         let std = (window.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n).sqrt();
                         cvs.push(std / mean);
                     }
